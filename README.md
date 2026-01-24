@@ -62,7 +62,7 @@ Typical build steps (Linux/macOS):
 
 ```bash
 git clone https://github.com/QryptCoin-Technologies-L-L-C/Qryptcoin.git
-cd qryptcoin-github
+cd Qryptcoin
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ```
@@ -71,7 +71,7 @@ Windows (MSVC):
 
 ```powershell
 git clone https://github.com/QryptCoin-Technologies-L-L-C/Qryptcoin.git
-cd qryptcoin-github
+cd Qryptcoin
 cmake -S . -B build -A x64
 cmake --build build --config Release --parallel
 ```
