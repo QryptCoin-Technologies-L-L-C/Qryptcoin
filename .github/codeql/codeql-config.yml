@@ -1,0 +1,4 @@
+name: "QryptCoin CodeQL configuration"
+paths-ignore:
+  - vendor/**
+  - third_party/**

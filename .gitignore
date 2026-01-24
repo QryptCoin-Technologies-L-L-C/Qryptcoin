@@ -1,0 +1,40 @@
+# Build trees
+build/
+build-*/
+build*/
+out/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+
+# IDEs
+.vscode/
+.idea/
+.vs/
+*.user
+*.suo
+*.user
+*.vcxproj.user
+*.VC.db
+*.VC.opendb
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.obj
+
+# Runtime data
+data/
+dist/
+*.tar.gz
+*.tgz
+*.dat
+*.log
+*.err
+rpc.cookie
+tmp_rpc.json
+
+# OS
+.DS_Store
+Thumbs.db

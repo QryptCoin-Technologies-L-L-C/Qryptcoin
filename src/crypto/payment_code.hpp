@@ -1,0 +1,31 @@
+#pragma once
+
+#include <array>
+#include <cstdint>
+#include <span>
+#include <string>
+#include <string_view>
+
+namespace qryptcoin::crypto {
+
+struct PaymentCodeV1 {
+  std::uint32_t network_id{0};
+  std::uint8_t kdf_id{0x01};
+  std::array<std::uint8_t, 32> scan_pubkey{};
+  std::array<std::uint8_t, 32> spend_root_commitment{};
+};
+
+constexpr std::size_t kPaymentCodeV1PayloadSize = 80;
+
+std::array<std::uint8_t, kPaymentCodeV1PayloadSize> SerializePaymentCodeV1(
+    const PaymentCodeV1& code);
+bool ParsePaymentCodeV1(std::span<const std::uint8_t> payload, PaymentCodeV1* out,
+                        std::string* error = nullptr);
+
+std::string PaymentCodeHrp(std::string_view network_hrp);
+std::string EncodePaymentCodeV1(const PaymentCodeV1& code, std::string_view network_hrp);
+bool DecodePaymentCodeV1(std::string_view text, std::string_view expected_network_hrp,
+                         PaymentCodeV1* out, std::string* error = nullptr);
+
+}  // namespace qryptcoin::crypto
+

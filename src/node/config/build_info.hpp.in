@@ -1,0 +1,11 @@
+#pragma once
+
+#include <string_view>
+
+namespace qryptcoin::config {
+inline constexpr std::string_view kProjectName{"@PROJECT_NAME@"};
+inline constexpr std::string_view kVersion{"@PROJECT_VERSION@"};
+inline constexpr std::string_view kBuildType{"@CMAKE_BUILD_TYPE@"};
+inline constexpr std::string_view kGitDescribe{"@GIT_DESCRIBE@"};
+inline constexpr std::string_view kCompiler{"@CMAKE_CXX_COMPILER_ID@ @CMAKE_CXX_COMPILER_VERSION@"};
+}  // namespace qryptcoin::config
