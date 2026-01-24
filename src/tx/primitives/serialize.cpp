@@ -296,7 +296,7 @@ bool DeserializeTransaction(const std::vector<std::uint8_t>& data, std::size_t* 
     if (!read_varint(data, cursor, &vin_count)) return false;
     if (has_witness && vin_count == 0) return false;
     if (vin_count > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) return false;
-    const std::size_t remaining_inputs = (cursor && *cursor <= data.size()) ? data.size() - *cursor : 0;
+    const std::size_t remaining_inputs = (*cursor <= data.size()) ? data.size() - *cursor : 0;
     if (kMinInputBytes == 0 || vin_count > remaining_inputs / kMinInputBytes) return false;
     out->vin.resize(static_cast<std::size_t>(vin_count));
     if (!DeserializeInputs(data, cursor, out, legacy_varint)) return false;
@@ -304,7 +304,7 @@ bool DeserializeTransaction(const std::vector<std::uint8_t>& data, std::size_t* 
     std::uint64_t vout_count = 0;
     if (!read_varint(data, cursor, &vout_count)) return false;
     if (vout_count > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) return false;
-    const std::size_t remaining_outputs = (cursor && *cursor <= data.size()) ? data.size() - *cursor : 0;
+    const std::size_t remaining_outputs = (*cursor <= data.size()) ? data.size() - *cursor : 0;
     if (kMinOutputBytes == 0 || vout_count > remaining_outputs / kMinOutputBytes) return false;
     out->vout.resize(static_cast<std::size_t>(vout_count));
     if (!DeserializeOutputs(data, cursor, out, legacy_varint)) return false;
@@ -342,7 +342,7 @@ bool DeserializeTransaction(const std::vector<std::uint8_t>& data, std::size_t* 
     std::uint64_t vin_count = 0;
     if (!read_varint(data, cursor, &vin_count)) return false;
     if (vin_count > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) return false;
-    const std::size_t remaining_inputs = (cursor && *cursor <= data.size()) ? data.size() - *cursor : 0;
+    const std::size_t remaining_inputs = (*cursor <= data.size()) ? data.size() - *cursor : 0;
     if (kMinInputBytes == 0 || vin_count > remaining_inputs / kMinInputBytes) return false;
     out->vin.resize(static_cast<std::size_t>(vin_count));
     for (auto& in : out->vin) {
@@ -380,7 +380,7 @@ bool DeserializeTransaction(const std::vector<std::uint8_t>& data, std::size_t* 
     std::uint64_t vout_count = 0;
     if (!read_varint(data, cursor, &vout_count)) return false;
     if (vout_count > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) return false;
-    const std::size_t remaining_outputs = (cursor && *cursor <= data.size()) ? data.size() - *cursor : 0;
+    const std::size_t remaining_outputs = (*cursor <= data.size()) ? data.size() - *cursor : 0;
     if (kMinOutputBytes == 0 || vout_count > remaining_outputs / kMinOutputBytes) return false;
     out->vout.resize(static_cast<std::size_t>(vout_count));
     if (!DeserializeOutputs(data, cursor, out, legacy_varint)) return false;
