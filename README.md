@@ -20,6 +20,13 @@ Key properties:
 
 This implementation enforces the consensus rules described in the protocol documentation and the published whitepaper.
 
+## Network Resources
+
+- **Block Explorer**: [explorer.qryptcoin.org](https://explorer.qryptcoin.org)
+- **Mempool Explorer**: [mempool.qryptcoin.org](https://mempool.qryptcoin.org)
+- **Website**: [qryptcoin.org](https://qryptcoin.org)
+
+
 ## Repository contents
 
 This repository includes:
