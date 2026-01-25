@@ -322,6 +322,13 @@ struct Options {
   bool require_authenticated_transport_explicit{false};
   bool allow_private_peers{false};
   std::vector<std::string> extra_static_seeds;
+  // Peer limits (0 = use defaults).
+  std::size_t max_inbound_peers{0};
+  std::size_t max_outbound_peers{0};
+  std::size_t max_total_peers{0};
+  // Target number of outbound connections to actively maintain.
+  // Default: 10 (8 full-relay + 2 block-relay-only).
+  std::size_t target_outbound_peers{10};
 };
 
 void PrintUsage() {
@@ -1183,6 +1190,17 @@ bool AppInitMain(Options opts, NodeContext* node, qryptcoin::net::AddrManager* a
   if (opts.seed_node) {
     net_config.listen_address = "0.0.0.0";
   }
+  // Apply peer limits from options.
+  net_config.max_inbound_peers = opts.max_inbound_peers;
+  net_config.max_outbound_peers = opts.max_outbound_peers;
+  net_config.max_total_peers = opts.max_total_peers;
+  net_config.target_outbound_peers = opts.target_outbound_peers;
+  // Update global config so RPC can report accurate peer limits.
+  auto& global_config = qryptcoin::config::GetMutableNetworkConfig();
+  global_config.max_inbound_peers = opts.max_inbound_peers;
+  global_config.max_outbound_peers = opts.max_outbound_peers;
+  global_config.max_total_peers = opts.max_total_peers;
+  global_config.target_outbound_peers = opts.target_outbound_peers;
   if (!opts.extra_static_seeds.empty()) {
     net_config.static_seeds.insert(net_config.static_seeds.end(),
                                    opts.extra_static_seeds.begin(),
@@ -1469,8 +1487,8 @@ void WaitForShutdown(NodeContext& node, qryptcoin::net::AddrManager* addrman,
     }
     MaintainOutboundPeers(node.peer_manager.get(), addrman,
                           qryptcoin::config::GetNetworkConfig().listen_port,
-                          /*target_outbound=*/8);
-    MaybeRunSeedLoop(node, addrman, dns_seeds, opts, &seed_state, /*target_outbound=*/8);
+                          opts.target_outbound_peers);
+    MaybeRunSeedLoop(node, addrman, dns_seeds, opts, &seed_state, opts.target_outbound_peers);
     if (addrman && !peers_path.empty()) {
       const auto now = clock::now();
       if (now >= next_peers_save) {

@@ -11,9 +11,11 @@ namespace qryptcoin::net {
 
 namespace {
 
-constexpr std::size_t kMaxInboundPeers = 32;
-constexpr std::size_t kMaxOutboundPeers = 32;
-constexpr std::size_t kMaxTotalPeers = 64;
+// Default peer limits for optimal network health.
+// 125 total connections (115 inbound, 10 outbound: 8 full-relay + 2 block-relay)
+constexpr std::size_t kDefaultMaxInboundPeers = 115;
+constexpr std::size_t kDefaultMaxOutboundPeers = 10;
+constexpr std::size_t kDefaultMaxTotalPeers = 125;
 // Per-subnet cap to avoid a single /24 dominating inbound slots.
 constexpr std::size_t kMaxPeersPerSubnet = 8;
 // Pre-handshake inbound throttling. This is applied before expensive crypto
@@ -33,6 +35,11 @@ constexpr std::chrono::minutes kBanDuration{60};
 }  // namespace
 
 PeerManager::PeerManager(config::NetworkConfig config) : config_(std::move(config)) {
+  // Apply configured peer limits or use defaults.
+  max_inbound_peers_ = config_.max_inbound_peers > 0 ? config_.max_inbound_peers : kDefaultMaxInboundPeers;
+  max_outbound_peers_ = config_.max_outbound_peers > 0 ? config_.max_outbound_peers : kDefaultMaxOutboundPeers;
+  max_total_peers_ = config_.max_total_peers > 0 ? config_.max_total_peers : kDefaultMaxTotalPeers;
+
   inbound_handshake_ = [](PeerSession* session, const config::NetworkConfig& cfg) -> bool {
     return session != nullptr && session->PerformHandshake(cfg);
   };
@@ -427,13 +434,13 @@ std::vector<PeerManager::PeerEntry>::iterator PeerManager::FindPeerLocked(std::u
 }
 
 bool PeerManager::HasCapacityLocked(bool inbound) const {
-  if (peers_.size() >= kMaxTotalPeers) {
+  if (peers_.size() >= max_total_peers_) {
     return false;
   }
   if (inbound) {
-    return CountInboundPeersLocked() < kMaxInboundPeers;
+    return CountInboundPeersLocked() < max_inbound_peers_;
   }
-  return CountOutboundPeersLocked() < kMaxOutboundPeers;
+  return CountOutboundPeersLocked() < max_outbound_peers_;
 }
 
 std::size_t PeerManager::CountInboundPeersLocked() const {

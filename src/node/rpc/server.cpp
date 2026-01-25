@@ -1585,7 +1585,7 @@ nlohmann::json RpcServer::HandleGetNetworkInfo() const {
     result["peer_count"] = stats.total;
     result["inbound"] = stats.inbound;
     result["outbound"] = stats.outbound;
-    result["outbound_target"] = 8;
+    result["outbound_target"] = qryptcoin::config::GetNetworkConfig().target_outbound_peers;
     result["listening"] = stats.listening;
     result["inbound_seen"] = stats.inbound_seen;
     result["reachable"] = stats.inbound_seen;

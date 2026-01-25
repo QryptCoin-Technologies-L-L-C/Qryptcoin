@@ -108,6 +108,11 @@ class PeerManager {
   std::atomic<bool> listening_{false};
   std::atomic<bool> seen_inbound_{false};
 
+  // Configurable peer limits (set from NetworkConfig or defaults).
+  std::size_t max_inbound_peers_{128};
+  std::size_t max_outbound_peers_{16};
+  std::size_t max_total_peers_{256};
+
   using InboundHandshakeFn =
       std::function<bool(PeerSession* session, const config::NetworkConfig& cfg)>;
   InboundHandshakeFn inbound_handshake_;

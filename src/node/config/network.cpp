@@ -66,6 +66,8 @@ const NetworkConfig& ConfigFor(NetworkType type) {
 
 const NetworkConfig& GetNetworkConfig() { return g_network_config; }
 
+NetworkConfig& GetMutableNetworkConfig() { return g_network_config; }
+
 void SelectNetwork(NetworkType type) { g_network_config = ConfigFor(type); }
 
 NetworkType NetworkFromString(std::string_view name) {

@@ -29,6 +29,13 @@ struct NetworkConfig {
   std::uint16_t listen_port{9375};
   std::uint16_t rpc_port{19735};
   std::uint16_t peers_max{32};
+  // Configurable peer limits. Zero means use built-in defaults.
+  std::size_t max_inbound_peers{0};
+  std::size_t max_outbound_peers{0};
+  std::size_t max_total_peers{0};
+  // Target number of outbound connections to maintain.
+  // Default: 10 (8 full-relay + 2 block-relay-only).
+  std::size_t target_outbound_peers{10};
   EncryptionMode encryption_mode{EncryptionMode::kEncrypted};
   bool encryption_required{false};
   // Base data directory used for persistence of P2P transport identity and
@@ -56,6 +63,7 @@ struct NetworkConfig {
 };
 
 const NetworkConfig& GetNetworkConfig();
+NetworkConfig& GetMutableNetworkConfig();
 void SelectNetwork(NetworkType type);
 NetworkType NetworkFromString(std::string_view name);
 std::string_view NetworkName(NetworkType type);
