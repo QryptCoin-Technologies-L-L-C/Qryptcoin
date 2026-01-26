@@ -30,6 +30,12 @@ class BlockSyncManager {
     std::uint64_t blocks_connected{0};
     std::uint64_t stalls_detected{0};
     std::uint64_t frame_payload_drops{0};
+    // Header sync instrumentation
+    std::uint64_t headers_pruned_total{0};
+    std::uint64_t headers_dropped_duplicate{0};
+    std::uint64_t getheaders_paused_backpressure{0};
+    std::uint64_t header_highwater_events{0};
+    std::size_t pending_headers{0};
   };
 
   struct PeerSyncStats {
@@ -147,6 +153,11 @@ class BlockSyncManager {
   void RemoveHeaderEntryLocked(const primitives::Hash256& hash);
   void PruneStaleHeadersLocked();
   void RemoveHeadersForPeerLocked(std::uint64_t peer_id);
+  // Returns true if we should pause header requests due to backpressure.
+  // This prevents "exceeded header storage caps" by pausing requests proactively.
+  bool ShouldPauseHeaderRequestsLocked(std::uint64_t peer_id) const;
+  // Check if backpressure conditions have cleared and we can resume.
+  bool CanResumeHeaderRequestsLocked(std::uint64_t peer_id) const;
   void StoreOrphanBlockLocked(const primitives::Hash256& hash,
                               primitives::CBlock block,
                               std::size_t payload_bytes);
@@ -209,6 +220,13 @@ class BlockSyncManager {
   std::atomic<std::uint64_t> inventories_received_{0};
   std::atomic<std::uint64_t> blocks_connected_{0};
   std::atomic<std::uint64_t> stalls_detected_{0};
+  // Header sync instrumentation counters
+  std::atomic<std::uint64_t> headers_pruned_total_{0};
+  std::atomic<std::uint64_t> headers_dropped_duplicate_{0};
+  std::atomic<std::uint64_t> getheaders_paused_backpressure_{0};
+  std::atomic<std::uint64_t> header_highwater_events_{0};
+  // Track if we're currently in backpressure mode (high-water hit, waiting for low-water)
+  std::atomic<bool> header_backpressure_active_{false};
 
   TransactionHandler on_transaction_received_;
   BlockConnectedHandler on_block_connected_;

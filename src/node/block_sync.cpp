@@ -35,6 +35,16 @@ constexpr std::size_t kMaxOrphanBlocks = 256;
 constexpr std::size_t kMaxOrphanBytes = 32 * 1024 * 1024;
 constexpr std::size_t kOrphanFifoCompactionThreshold = kMaxOrphanBlocks * 8;
 
+// Backpressure thresholds for header sync (high-water/low-water to avoid oscillation)
+// High-water: pause requesting headers when these limits are reached
+constexpr std::size_t kHeadersAheadHighWater = 1500;  // Max headers ahead of chain tip
+constexpr std::size_t kHeadersPerPeerHighWater = 3000;  // Per-peer pending header limit
+constexpr std::size_t kDownloadQueueHighWater = 512;  // Max blocks in download queue
+// Low-water: resume requesting headers when below these
+constexpr std::size_t kHeadersAheadLowWater = 500;  // Resume when gap shrinks to this
+constexpr std::size_t kHeadersPerPeerLowWater = 1000;  // Resume when peer headers drop to this
+constexpr std::size_t kDownloadQueueLowWater = 128;  // Resume when queue shrinks to this
+
 std::string HashToHex(const primitives::Hash256& hash) {
   return util::HexEncode(std::span<const std::uint8_t>(hash.data(), hash.size()));
 }
@@ -139,12 +149,17 @@ BlockSyncManager::SyncStats BlockSyncManager::GetStats() const {
     stats.best_header_height = best_header_height_;
     stats.pending_blocks =
         download_queue_.size() + inflight_blocks_.size() + orphan_blocks_.size();
+    stats.pending_headers = header_index_.size();
   }
   stats.getheaders_sent = getheaders_sent_.load();
   stats.headers_received = headers_received_.load();
   stats.inventories_received = inventories_received_.load();
   stats.blocks_connected = blocks_connected_.load();
   stats.stalls_detected = stalls_detected_.load();
+  stats.headers_pruned_total = headers_pruned_total_.load();
+  stats.headers_dropped_duplicate = headers_dropped_duplicate_.load();
+  stats.getheaders_paused_backpressure = getheaders_paused_backpressure_.load();
+  stats.header_highwater_events = header_highwater_events_.load();
   const auto drops = net::FrameChannel::GetDropStats();
   stats.frame_payload_drops = drops.payload_too_large;
   return stats;
@@ -665,19 +680,48 @@ void BlockSyncManager::HandleHeaders(const net::PeerManager::PeerInfo& info,
         break;
       }
 
-      // Apply storage caps before inserting.
+      // Apply storage caps before inserting. If we would exceed caps, prune first
+      // rather than banning the peer - caps violations due to slow block download
+      // are our problem, not the peer's fault.
       const auto existing_for_peer =
           headers_by_peer_.count(info.id) ? headers_by_peer_[info.id] : 0;
       std::size_t new_unique = 0;
+      std::size_t duplicates = 0;
       for (const auto& entry : accepted) {
         if (header_index_.find(HashToHex(entry.hash)) == header_index_.end()) {
           ++new_unique;
+        } else {
+          ++duplicates;
         }
       }
-      if (existing_for_peer + new_unique > kMaxStoredHeadersPerPeer ||
-          header_index_.size() + new_unique > kMaxStoredHeadersTotal) {
-        fail(20, "[sync] peer " + std::to_string(info.id) + " exceeded header storage caps");
-        break;
+      if (duplicates > 0) {
+        headers_dropped_duplicate_.fetch_add(duplicates);
+      }
+
+      // Check if we would exceed caps
+      const bool would_exceed_peer_cap = existing_for_peer + new_unique > kMaxStoredHeadersPerPeer;
+      const bool would_exceed_total_cap = header_index_.size() + new_unique > kMaxStoredHeadersTotal;
+
+      if (would_exceed_peer_cap || would_exceed_total_cap) {
+        // Try to prune stale headers first to make room
+        PruneStaleHeadersLocked();
+        header_backpressure_active_.store(true);
+        header_highwater_events_.fetch_add(1);
+
+        // Recheck after pruning
+        const auto existing_after_prune =
+            headers_by_peer_.count(info.id) ? headers_by_peer_[info.id] : 0;
+        const bool still_exceeds_peer = existing_after_prune + new_unique > kMaxStoredHeadersPerPeer;
+        const bool still_exceeds_total = header_index_.size() + new_unique > kMaxStoredHeadersTotal;
+
+        if (still_exceeds_peer || still_exceeds_total) {
+          // Still exceeding after prune - log but don't ban, just skip these headers.
+          // This is backpressure, not a protocol violation.
+          std::cerr << "[sync] header backpressure: skipping " << new_unique << " headers from peer "
+                    << info.id << " (peer_headers=" << existing_after_prune
+                    << ", total=" << header_index_.size() << ")\n";
+          break;
+        }
       }
 
       for (const auto& entry : accepted) {
@@ -1151,23 +1195,25 @@ void BlockSyncManager::HandleTransaction(const net::PeerManager::PeerInfo& info,
 void BlockSyncManager::SendGetHeaders(const net::PeerManager::PeerInfo& info,
                                       const std::shared_ptr<net::PeerSession>& session) {
   if (!running_) return;
-  // Apply backpressure: don't request more headers if we already have a large
-  // gap between best_header_height and the chain tip, or if the header storage
-  // is getting full. This prevents "exceeded header storage caps" errors.
+  // Apply backpressure with high/low water thresholds to avoid oscillation.
+  // This prevents "exceeded header storage caps" by pausing proactively.
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    const auto chain_height = chain_.Height();
-    const auto gap =
-        best_header_height_ > chain_height ? (best_header_height_ - chain_height) : 0;
-    // Don't request more headers if we're already 2000+ blocks ahead
-    if (gap >= kMaxHeadersPerRequest) {
-      return;
+    // Check if we already have an outstanding getheaders for this peer
+    // (don't pipeline multiple requests)
+    auto it_worker = peer_workers_.find(info.id);
+    if (it_worker != peer_workers_.end()) {
+      const auto& worker = it_worker->second;
+      const auto now = std::chrono::steady_clock::now();
+      if (worker.headers_expected_until.time_since_epoch().count() != 0 &&
+          now <= worker.headers_expected_until) {
+        // Already have outstanding request, don't pipeline
+        return;
+      }
     }
-    // Also check if header storage is getting close to limits
-    const auto peer_headers = headers_by_peer_.count(info.id) ? headers_by_peer_.at(info.id) : 0;
-    if (peer_headers + kMaxHeadersPerRequest > kMaxStoredHeadersPerPeer ||
-        header_index_.size() + kMaxHeadersPerRequest > kMaxStoredHeadersTotal) {
-      // Storage is getting full, let block downloads catch up first
+
+    if (ShouldPauseHeaderRequestsLocked(info.id)) {
+      getheaders_paused_backpressure_.fetch_add(1);
       return;
     }
   }
@@ -1364,24 +1410,34 @@ void BlockSyncManager::RemoveHeaderEntryLocked(const primitives::Hash256& hash) 
 }
 
 void BlockSyncManager::PruneStaleHeadersLocked() {
-  // Remove headers that are already in the chain (below or at the tip).
-  // This prevents header accumulation when block downloads are slow.
+  // Remove headers that are no longer needed. This implements cleanup that
+  // does NOT depend on "blocks connect" - it removes headers based on:
+  // 1. Headers at or below the current chain height (already consumed)
+  // 2. Headers from disconnected peers (orphaned)
+  // This decouples header cleanup from block connection for proper backpressure.
   const auto chain_height = chain_.Height();
+  const auto initial_size = header_index_.size();
   std::vector<std::string> to_remove;
   to_remove.reserve(header_index_.size() / 2);
 
+  std::size_t stale_count = 0;
+  std::size_t orphan_count = 0;
+
   for (const auto& kv : header_index_) {
     const auto& entry = kv.second;
-    // If the header is at or below the chain tip, it's either already
-    // connected or on a stale branch. Either way, we don't need it.
+    // If the header is at or below the chain tip, it's already been
+    // "consumed" - we don't need it for building the download queue anymore.
+    // This is the key fix: cleanup happens based on chain height, not block connection.
     if (entry.height <= chain_height) {
       to_remove.push_back(kv.first);
+      ++stale_count;
       continue;
     }
-    // If the header's source peer is no longer connected, clean it up
-    // to free capacity for active peers.
+    // If the header's source peer is no longer connected, clean it up.
+    // This prevents memory leaks from disconnected peer headers.
     if (peer_workers_.find(entry.source_peer_id) == peer_workers_.end()) {
       to_remove.push_back(kv.first);
+      ++orphan_count;
       continue;
     }
   }
@@ -1405,8 +1461,21 @@ void BlockSyncManager::PruneStaleHeadersLocked() {
   }
 
   if (!to_remove.empty()) {
-    std::cerr << "[sync] pruned " << to_remove.size() << " stale headers (chain_height="
-              << chain_height << ", remaining=" << header_index_.size() << ")\n";
+    headers_pruned_total_.fetch_add(to_remove.size());
+    std::cerr << "[sync] pruned " << to_remove.size() << " headers ("
+              << stale_count << " stale, " << orphan_count << " orphan)"
+              << " chain_height=" << chain_height
+              << " remaining=" << header_index_.size()
+              << " (was " << initial_size << ")\n";
+
+    // Check if we can clear backpressure
+    const auto gap = best_header_height_ > chain_height ? (best_header_height_ - chain_height) : 0;
+    if (gap <= kHeadersAheadLowWater && header_index_.size() <= kDownloadQueueLowWater) {
+      if (header_backpressure_active_.load()) {
+        header_backpressure_active_.store(false);
+        std::cerr << "[sync] backpressure cleared after prune\n";
+      }
+    }
   }
 }
 
@@ -1425,7 +1494,69 @@ void BlockSyncManager::RemoveHeadersForPeerLocked(std::uint64_t peer_id) {
   if (!to_remove.empty()) {
     std::cerr << "[sync] removed " << to_remove.size() << " headers from disconnected peer "
               << peer_id << "\n";
+    headers_pruned_total_.fetch_add(to_remove.size());
   }
+}
+
+bool BlockSyncManager::ShouldPauseHeaderRequestsLocked(std::uint64_t peer_id) const {
+  const auto chain_height = chain_.Height();
+  const auto gap = best_header_height_ > chain_height ? (best_header_height_ - chain_height) : 0;
+  const auto peer_headers = headers_by_peer_.count(peer_id) ? headers_by_peer_.at(peer_id) : 0;
+  const auto queue_size = download_queue_.size();
+
+  // If we're in backpressure mode, only resume at low-water marks
+  if (header_backpressure_active_.load()) {
+    return !CanResumeHeaderRequestsLocked(peer_id);
+  }
+
+  // Check high-water marks - pause if any are exceeded
+  if (gap >= kHeadersAheadHighWater) {
+    std::cerr << "[sync] backpressure: headers " << gap << " ahead of chain (high-water="
+              << kHeadersAheadHighWater << ")\n";
+    return true;
+  }
+  if (peer_headers >= kHeadersPerPeerHighWater) {
+    std::cerr << "[sync] backpressure: peer " << peer_id << " has " << peer_headers
+              << " pending headers (high-water=" << kHeadersPerPeerHighWater << ")\n";
+    return true;
+  }
+  if (queue_size >= kDownloadQueueHighWater) {
+    std::cerr << "[sync] backpressure: download queue has " << queue_size
+              << " blocks (high-water=" << kDownloadQueueHighWater << ")\n";
+    return true;
+  }
+
+  // Also check absolute limits with some margin
+  if (peer_headers + kMaxHeadersPerRequest > kMaxStoredHeadersPerPeer) {
+    return true;
+  }
+  if (header_index_.size() + kMaxHeadersPerRequest > kMaxStoredHeadersTotal) {
+    return true;
+  }
+
+  return false;
+}
+
+bool BlockSyncManager::CanResumeHeaderRequestsLocked(std::uint64_t peer_id) const {
+  const auto chain_height = chain_.Height();
+  const auto gap = best_header_height_ > chain_height ? (best_header_height_ - chain_height) : 0;
+  const auto peer_headers = headers_by_peer_.count(peer_id) ? headers_by_peer_.at(peer_id) : 0;
+  const auto queue_size = download_queue_.size();
+
+  // All conditions must be at or below low-water to resume
+  const bool gap_ok = gap <= kHeadersAheadLowWater;
+  const bool peer_ok = peer_headers <= kHeadersPerPeerLowWater;
+  const bool queue_ok = queue_size <= kDownloadQueueLowWater;
+
+  if (gap_ok && peer_ok && queue_ok) {
+    // Reset backpressure flag (const_cast needed since this is called from const context)
+    const_cast<std::atomic<bool>&>(header_backpressure_active_).store(false);
+    std::cerr << "[sync] backpressure cleared: gap=" << gap << ", peer_headers=" << peer_headers
+              << ", queue=" << queue_size << "\n";
+    return true;
+  }
+
+  return false;
 }
 
 bool BlockSyncManager::PrepareBlockRequestForPeerLocked(std::uint64_t peer_id,
@@ -1524,11 +1655,43 @@ void BlockSyncManager::StallWatcher(std::stop_token stop) {
   while (!stop.stop_requested()) {
     std::this_thread::sleep_for(std::chrono::seconds(5));
     std::vector<std::pair<std::uint64_t, primitives::Hash256>> stalled;
+    bool backpressure_was_active = header_backpressure_active_.load();
+    bool should_resume_headers = false;
+    std::vector<std::pair<net::PeerManager::PeerInfo, std::shared_ptr<net::PeerSession>>> peers_to_resume;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       // Proactively prune headers that are no longer needed to prevent
       // "exceeded header storage caps" errors during slow block downloads.
+      // This is the key fix: cleanup does NOT depend on blocks connecting.
       PruneStaleHeadersLocked();
+
+      // Check if backpressure has cleared and we should resume header requests
+      if (backpressure_was_active) {
+        const auto chain_height = chain_.Height();
+        const auto gap = best_header_height_ > chain_height ? (best_header_height_ - chain_height) : 0;
+        const auto queue_size = download_queue_.size();
+
+        if (gap <= kHeadersAheadLowWater && queue_size <= kDownloadQueueLowWater) {
+          should_resume_headers = true;
+          header_backpressure_active_.store(false);
+          std::cerr << "[sync] StallWatcher: backpressure cleared, resuming header sync "
+                    << "(gap=" << gap << ", queue=" << queue_size << ")\n";
+
+          // Collect peers that can resume
+          for (const auto& kv : peer_workers_) {
+            const auto& worker = kv.second;
+            if (worker.session && !worker.info.inbound) {
+              const auto peer_headers = headers_by_peer_.count(kv.first)
+                                            ? headers_by_peer_.at(kv.first)
+                                            : 0;
+              if (peer_headers <= kHeadersPerPeerLowWater) {
+                peers_to_resume.emplace_back(worker.info, worker.session);
+              }
+            }
+          }
+        }
+      }
+
       const auto now = clock::now();
       for (auto it = inflight_blocks_.begin(); it != inflight_blocks_.end();) {
         const auto& entry = it->second;
@@ -1573,6 +1736,12 @@ void BlockSyncManager::StallWatcher(std::stop_token stop) {
     }
     if (!stalled.empty()) {
       RequestFromAnyPeer();
+    }
+    // Resume header requests for peers if backpressure cleared
+    if (should_resume_headers) {
+      for (const auto& [info, session] : peers_to_resume) {
+        SendGetHeaders(info, session);
+      }
     }
   }
 }
