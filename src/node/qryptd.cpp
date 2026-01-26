@@ -296,6 +296,7 @@ struct Options {
   bool rpc_read_only{false};
   std::uint16_t p2p_port{0};
   bool p2p_port_explicit{false};
+  bool listen_enabled{true};
   std::string mining_address;
   bool allow_generate{false};
   std::vector<std::string> connect_peers;
@@ -333,32 +334,37 @@ struct Options {
 
 void PrintUsage() {
   std::cout << "qryptd options:\n"
-            << "  --network <net>            mainnet, testnet, regtest, signet (default: mainnet)\n"
-            << "  --data-dir <path>          Base data directory (default: data/<network>)\n"
-            << "  --wallet <path>            Wallet file path (default: <data>/wallet.dat)\n"
-            << "  --wallet-pass <passphrase> Wallet passphrase (insecure on shared shells)\n"
-            << "  --wallet-pass-env <name>   Environment variable with the wallet passphrase\n"
-            << "  --disable-wallet           Disable wallet loading and wallet RPCs\n"
-            << "  --no-wallet-autoload       Do not auto-load/create a wallet at startup (wallet RPC remains enabled)\n"
-            << "  --rpc-bind <addr>          RPC bind address (default: 127.0.0.1)\n"
-            << "  --rpc-port <port>          RPC port (default: network-specific)\n"
-            << "  --rpc-user <name>          RPC basic auth user\n"
-            << "  --rpc-pass <secret>        RPC basic auth password (use env or prompt if possible)\n"
-            << "  --rpc-pass-env <name>      Env var containing the RPC password\n"
-            << "  --rpc-allow-ip <addr>      Allow specific client IP (repeatable). Default: loopback only\n"
-            << "  --unsafe-allow-remote      Permit non-loopback RPC binds (requires auth + allowlist)\n"
-            << "  --rpc-require-auth         Require HTTP basic auth for RPC (default: on)\n"
-            << "  --rpc-read-only           Restrict RPC to non-mutating, read-only methods\n"
-            << "  --rpc-gbt-rate <n>         Max getblocktemplate RPCs per second (0=unlimited, default: 5)\n"
-            << "  --rpc-submit-rate <n>      Max submitblock RPCs per second (0=unlimited, default: 10)\n"
-            << "  --p2p-port <port>          P2P listen port override\n"
-            << "  --mining-address <qry1...> Default reward address for getblocktemplate\n"
-            << "  --connect-peer <host:port> Manually connect to a specific peer (repeatable)\n"
-            << "  --mempool-limit-mb <mb>    Target mempool size limit in MB (default: 300)\n"
-            << "  --mempool-expiry-seconds <sec> Evict mempool txs older than <sec> (0=disable, default: 1209600)\n"
-            << "  --mempool-rebroadcast-seconds <sec> Re-announce mempool txids every <sec> (0=disable, default: 1800)\n"
-            << "  --mempool-persist          Persist mempool to disk (default: on)\n"
-            << "  --no-mempool-persist       Disable mempool persistence\n"
+             << "  --network <net>            mainnet, testnet, regtest, signet (default: mainnet)\n"
+             << "  --data-dir <path>          Base data directory (default: data/<network>)\n"
+             << "  --wallet <path>            Wallet file path (default: <data>/wallet.dat)\n"
+             << "  --wallet-pass <passphrase> Wallet passphrase (insecure on shared shells)\n"
+             << "  --wallet-pass-env <name>   Environment variable with the wallet passphrase\n"
+             << "  --disable-wallet           Disable wallet loading and wallet RPCs\n"
+             << "  --no-wallet-autoload       Do not auto-load/create a wallet at startup (wallet RPC remains enabled)\n"
+             << "  --rpc-bind <addr>          RPC bind address (default: 127.0.0.1)\n"
+             << "  --rpc-port <port>          RPC port (default: network-specific)\n"
+             << "  --rpc-user <name>          RPC basic auth user\n"
+             << "  --rpc-pass <secret>        RPC basic auth password (use env or prompt if possible)\n"
+             << "  --rpc-pass-env <name>      Env var containing the RPC password\n"
+             << "  --rpc-allow-ip <addr>      Allow specific client IP (repeatable). Default: loopback only\n"
+             << "  --unsafe-allow-remote      Permit non-loopback RPC binds (requires auth + allowlist)\n"
+             << "  --rpc-require-auth         Require HTTP basic auth for RPC (default: on)\n"
+             << "  --rpc-read-only           Restrict RPC to non-mutating, read-only methods\n"
+             << "  --rpc-gbt-rate <n>         Max getblocktemplate RPCs per second (0=unlimited, default: 5)\n"
+             << "  --rpc-submit-rate <n>      Max submitblock RPCs per second (0=unlimited, default: 10)\n"
+             << "  --p2p-port <port>          P2P listen port override\n"
+             << "  --nolisten                 Disable inbound P2P connections (outbound-only)\n"
+             << "  --listen <0|1>             Enable/disable inbound P2P (default: 1)\n"
+             << "  --mining-address <qry1...> Default reward address for getblocktemplate\n"
+             << "  --connect-peer <host:port> Manually connect to a specific peer (repeatable)\n"
+             << "  --max-inbound-peers <n>    Override inbound peer limit (0=default)\n"
+             << "  --max-outbound-peers <n>   Override outbound peer limit (0=default)\n"
+             << "  --max-total-peers <n>      Override total peer limit (0=default)\n"
+             << "  --mempool-limit-mb <mb>    Target mempool size limit in MB (default: 300)\n"
+             << "  --mempool-expiry-seconds <sec> Evict mempool txs older than <sec> (0=disable, default: 1209600)\n"
+             << "  --mempool-rebroadcast-seconds <sec> Re-announce mempool txids every <sec> (0=disable, default: 1800)\n"
+             << "  --mempool-persist          Persist mempool to disk (default: on)\n"
+             << "  --no-mempool-persist       Disable mempool persistence\n"
             << "  --mempool-persist-path <path> Override persistence path (default: <data>/mempool.json)\n"
             << "  --mempool-persist-interval-seconds <sec> Flush persisted mempool every <sec> when dirty (0=disable, default: 60)\n"
             << "  --fee-estimator-decay <r>  Rolling fee estimator decay rate (0<r<1, default: 0.95)\n"
@@ -600,6 +606,18 @@ void ApplyConfigOption(const std::string& raw_key, const std::string& value, Opt
   } else if (key == "p2pport" || key == "port") {
     opts->p2p_port = static_cast<std::uint16_t>(std::stoi(value));
     opts->p2p_port_explicit = true;
+  } else if (key == "nolisten" || key == "listen") {
+    if (key == "listen") {
+      opts->listen_enabled = ParseBool(value);
+    } else {
+      opts->listen_enabled = false;
+    }
+  } else if (key == "maxinboundpeers") {
+    opts->max_inbound_peers = static_cast<std::size_t>(std::stoul(value));
+  } else if (key == "maxoutboundpeers") {
+    opts->max_outbound_peers = static_cast<std::size_t>(std::stoul(value));
+  } else if (key == "maxtotalpeers") {
+    opts->max_total_peers = static_cast<std::size_t>(std::stoul(value));
   } else if (key == "miningaddress") {
     opts->mining_address = value;
   } else if (key == "connect" || key == "connectpeer") {
@@ -783,6 +801,10 @@ Options ParseOptions(int argc, char** argv) {
     } else if (arg == "--p2p-port") {
       opts.p2p_port = static_cast<std::uint16_t>(std::stoi(ensure_value(i)));
       opts.p2p_port_explicit = true;
+    } else if (arg == "--nolisten" || arg == "--listen=0") {
+      opts.listen_enabled = false;
+    } else if (arg == "--listen") {
+      opts.listen_enabled = ParseBool(ensure_value(i));
     } else if (arg == "--mining-address") {
       opts.mining_address = ensure_value(i);
     } else if (arg == "--allow-generate") {
@@ -803,6 +825,12 @@ Options ParseOptions(int argc, char** argv) {
       opts.allow_private_peers = true;
     } else if (arg == "--connect-peer") {
       opts.connect_peers.push_back(ensure_value(i));
+    } else if (arg == "--max-inbound-peers") {
+      opts.max_inbound_peers = static_cast<std::size_t>(std::stoul(ensure_value(i)));
+    } else if (arg == "--max-outbound-peers") {
+      opts.max_outbound_peers = static_cast<std::size_t>(std::stoul(ensure_value(i)));
+    } else if (arg == "--max-total-peers") {
+      opts.max_total_peers = static_cast<std::size_t>(std::stoul(ensure_value(i)));
     } else if (arg == "--fee-estimator-decay") {
       opts.fee_estimator_decay = std::stod(ensure_value(i));
     } else if (arg == "--fee-estimator-samples") {
@@ -1252,8 +1280,13 @@ bool AppInitMain(Options opts, NodeContext* node, qryptcoin::net::AddrManager* a
 
   LogDebug("Starting block sync manager");
   node->sync_manager->Start();
-  LogDebug("Starting peer listener on port " + std::to_string(net_config.listen_port));
-  node->peer_manager->StartListener();
+  if (opts.listen_enabled) {
+    LogDebug("Starting peer listener on port " + std::to_string(net_config.listen_port));
+    node->peer_manager->StartListener();
+  } else {
+    LogDebug("P2P listener disabled via --nolisten/listen=0");
+    std::cout << "[qryptd] info: P2P listener disabled (--nolisten)\n";
+  }
 
   qryptcoin::rpc::HttpServer::Options http_opts;
   http_opts.bind_address = opts.rpc_bind;
@@ -1330,7 +1363,12 @@ bool AppInitMain(Options opts, NodeContext* node, qryptcoin::net::AddrManager* a
     }
   }
   if (!connected) {
-    std::cout << "[qryptd] warn: no seed connections succeeded; waiting for inbound peers\n";
+    if (opts.listen_enabled) {
+      std::cout << "[qryptd] warn: no seed connections succeeded; waiting for inbound peers\n";
+    } else {
+      std::cout << "[qryptd] warn: no seed connections succeeded and inbound P2P is disabled; "
+                   "configure connect= targets\n";
+    }
   }
   return true;
 }

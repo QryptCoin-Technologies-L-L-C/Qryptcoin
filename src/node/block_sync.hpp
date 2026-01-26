@@ -19,6 +19,8 @@
 
 namespace qryptcoin::node {
 
+class BlockSyncManagerTestHelper;
+
 class BlockSyncManager {
  public:
   struct SyncStats {
@@ -36,6 +38,13 @@ class BlockSyncManager {
     std::uint64_t getheaders_paused_backpressure{0};
     std::uint64_t header_highwater_events{0};
     std::size_t pending_headers{0};
+    // New gauges
+    std::size_t headers_gap{0};  // best header height minus chain height
+    std::size_t active_outbound_peers{0};
+    // New counters
+    std::uint64_t block_stall_recoveries{0};
+    std::uint64_t inflight_block_timeouts{0};
+    std::uint64_t unsolicited_headers_ignored{0};
   };
 
   struct PeerSyncStats {
@@ -106,6 +115,7 @@ class BlockSyncManager {
     std::size_t stall_count{0};
     std::chrono::steady_clock::time_point last_response{};
     std::chrono::steady_clock::time_point next_request_allowed{};
+    bool headers_request_outstanding{false};
     // When we send getheaders to a peer we expect a headers response
     // within a short window. Unsolicited headers are ignored and scored
     // as misbehavior to avoid header-flood memory DoS.
@@ -205,6 +215,8 @@ class BlockSyncManager {
   std::size_t orphan_bytes_{0};
   std::size_t best_header_height_{0};
   primitives::Hash256 best_header_hash_{};
+  std::chrono::steady_clock::time_point last_block_progress_time_{};
+  std::chrono::steady_clock::time_point last_sync_tick_{};
   struct HeaderEntry {
     primitives::Hash256 hash{};
     primitives::Hash256 previous{};
@@ -220,6 +232,9 @@ class BlockSyncManager {
   std::atomic<std::uint64_t> inventories_received_{0};
   std::atomic<std::uint64_t> blocks_connected_{0};
   std::atomic<std::uint64_t> stalls_detected_{0};
+  std::atomic<std::uint64_t> block_stall_recoveries_total_{0};
+  std::atomic<std::uint64_t> inflight_block_timeouts_total_{0};
+  std::atomic<std::uint64_t> unsolicited_headers_ignored_total_{0};
   // Header sync instrumentation counters
   std::atomic<std::uint64_t> headers_pruned_total_{0};
   std::atomic<std::uint64_t> headers_dropped_duplicate_{0};
@@ -240,12 +255,14 @@ class BlockSyncManager {
   // Simple, type-specific rate limits (per peer per second).
   std::atomic<std::size_t> inv_limit_per_sec_{1000};
   std::atomic<std::size_t> getdata_limit_per_sec_{200};
-  std::atomic<std::size_t> headers_limit_per_sec_{50};
-  // Blocks are typically delivered only in response to our own getdata
-  // requests and can arrive in bursts during initial sync. Rely on the
-  // FrameChannel and overall message-rate limits for DoS protection.
-  std::atomic<std::size_t> block_limit_per_sec_{0};
-  std::atomic<std::size_t> tx_limit_per_sec_{200};
-};
+   std::atomic<std::size_t> headers_limit_per_sec_{50};
+   // Blocks are typically delivered only in response to our own getdata
+   // requests and can arrive in bursts during initial sync. Rely on the
+   // FrameChannel and overall message-rate limits for DoS protection.
+   std::atomic<std::size_t> block_limit_per_sec_{0};
+   std::atomic<std::size_t> tx_limit_per_sec_{200};
+
+   friend class BlockSyncManagerTestHelper;
+ };
 
 }  // namespace qryptcoin::node

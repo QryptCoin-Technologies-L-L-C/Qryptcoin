@@ -80,6 +80,9 @@ void BlockSyncManager::Start() {
       best_header_height_ = 0;
       best_header_hash_.fill(0);
     }
+    const auto now = std::chrono::steady_clock::now();
+    last_block_progress_time_ = now;
+    last_sync_tick_ = now;
   }
   peers_.SetPeerConnectedHandler(
       [this](const net::PeerManager::PeerInfo& info,
@@ -144,18 +147,31 @@ bool BlockSyncManager::IsSynced() const {
 
 BlockSyncManager::SyncStats BlockSyncManager::GetStats() const {
   SyncStats stats;
+  const auto chain_height = chain_.Height();
+  std::size_t best_header_height = 0;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     stats.best_header_height = best_header_height_;
+    best_header_height = best_header_height_;
     stats.pending_blocks =
         download_queue_.size() + inflight_blocks_.size() + orphan_blocks_.size();
     stats.pending_headers = header_index_.size();
+    for (const auto& kv : peer_workers_) {
+      const auto& worker = kv.second;
+      if (!worker.info.inbound && worker.session) {
+        ++stats.active_outbound_peers;
+      }
+    }
   }
+  stats.headers_gap = best_header_height > chain_height ? (best_header_height - chain_height) : 0;
   stats.getheaders_sent = getheaders_sent_.load();
   stats.headers_received = headers_received_.load();
   stats.inventories_received = inventories_received_.load();
   stats.blocks_connected = blocks_connected_.load();
   stats.stalls_detected = stalls_detected_.load();
+  stats.block_stall_recoveries = block_stall_recoveries_total_.load();
+  stats.inflight_block_timeouts = inflight_block_timeouts_total_.load();
+  stats.unsolicited_headers_ignored = unsolicited_headers_ignored_total_.load();
   stats.headers_pruned_total = headers_pruned_total_.load();
   stats.headers_dropped_duplicate = headers_dropped_duplicate_.load();
   stats.getheaders_paused_backpressure = getheaders_paused_backpressure_.load();
@@ -411,13 +427,25 @@ void BlockSyncManager::PeerLoop(std::stop_token stop, net::PeerManager::PeerInfo
           return;
         }
         break;
-      case Command::kHeaders:
-        if (headers_limit > 0 && ++headers_count > headers_limit) {
-          std::cerr << "[sync] peer " << info.id << " exceeded HEADERS rate limit\n";
+      case Command::kHeaders: {
+        bool headers_requested = false;
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          auto it = peer_workers_.find(info.id);
+          if (it != peer_workers_.end()) {
+            headers_requested = it->second.headers_request_outstanding;
+          }
+        }
+        // Only rate-limit unsolicited headers; headers sent in response to our
+        // own getheaders requests should not be throttled.
+        if (!headers_requested && headers_limit > 0 && ++headers_count > headers_limit) {
+          std::cerr << "[sync] peer " << info.id
+                    << " exceeded unsolicited HEADERS rate limit\n";
           peers_.AddBanScore(info.id, 10);
           return;
         }
         break;
+      }
       case Command::kBlock:
         if (block_limit > 0 && ++block_count > block_limit) {
           std::cerr << "[sync] peer " << info.id << " exceeded BLOCK rate limit\n";
@@ -519,6 +547,23 @@ void BlockSyncManager::HandleHeaders(const net::PeerManager::PeerInfo& info,
                                      const std::shared_ptr<net::PeerSession>& session,
                                      const net::messages::HeadersMessage& headers) {
   headers_received_.fetch_add(headers.headers.size());
+  bool headers_expected = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it_worker = peer_workers_.find(info.id);
+    if (it_worker == peer_workers_.end()) {
+      return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    headers_expected =
+        it_worker->second.headers_expected_until.time_since_epoch().count() != 0 &&
+        now <= it_worker->second.headers_expected_until;
+    // Treat any HEADERS message as satisfying the outstanding getheaders window,
+    // even if malformed, so the peer cannot keep flooding within the timeout
+    // interval.
+    it_worker->second.headers_expected_until = std::chrono::steady_clock::time_point{};
+    it_worker->second.headers_request_outstanding = false;
+  }
   if (headers.headers.empty()) {
     return;
   }
@@ -526,6 +571,13 @@ void BlockSyncManager::HandleHeaders(const net::PeerManager::PeerInfo& info,
     std::cerr << "[sync] peer " << info.id << " sent oversized headers batch ("
               << headers.headers.size() << ")\n";
     peers_.AddBanScore(info.id, 20);
+    return;
+  }
+  if (!headers_expected) {
+    unsolicited_headers_ignored_total_.fetch_add(1);
+    std::cerr << "[sync] peer " << info.id
+              << " sent unsolicited HEADERS, ignoring\n";
+    peers_.AddBanScore(info.id, 5);
     return;
   }
   std::vector<HeaderEntry> accepted;
@@ -546,22 +598,7 @@ void BlockSyncManager::HandleHeaders(const net::PeerManager::PeerInfo& info,
       return;
     }
 
-    const auto now = std::chrono::steady_clock::now();
-    const bool headers_expected =
-        it_worker->second.headers_expected_until.time_since_epoch().count() != 0 &&
-        now <= it_worker->second.headers_expected_until;
-    // Treat any HEADERS message as satisfying the outstanding getheaders
-    // window, even if malformed, so the peer cannot keep flooding within
-    // the timeout interval.
-    it_worker->second.headers_expected_until = std::chrono::steady_clock::time_point{};
-
     do {
-      if (!headers_expected) {
-        fail(5, "[sync] peer " + std::to_string(info.id) +
-                     " sent unsolicited HEADERS, ignoring");
-        break;
-      }
-
       // If our header state drifts too far (e.g. due to a previous buggy build
       // or a hostile peer before caps were introduced), reset to avoid
       // unbounded traversal and allocations.
@@ -1052,6 +1089,10 @@ void BlockSyncManager::HandleBlock(const net::PeerManager::PeerInfo& info,
     }
   }
   blocks_connected_.fetch_add(1);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    last_block_progress_time_ = std::chrono::steady_clock::now();
+  }
   if (block_handler) {
     block_handler(block, static_cast<std::uint32_t>(chain_.Height()));
   }
@@ -1088,6 +1129,10 @@ void BlockSyncManager::HandleBlock(const net::PeerManager::PeerInfo& info,
         }
       }
       blocks_connected_.fetch_add(1);
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_block_progress_time_ = std::chrono::steady_clock::now();
+      }
       if (block_handler) {
         block_handler(orphan, static_cast<std::uint32_t>(chain_.Height()));
       }
@@ -1226,8 +1271,10 @@ void BlockSyncManager::SendGetHeaders(const net::PeerManager::PeerInfo& info,
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = peer_workers_.find(info.id);
     if (it != peer_workers_.end()) {
+      const auto now = std::chrono::steady_clock::now();
+      it->second.headers_request_outstanding = true;
       it->second.headers_expected_until =
-          std::chrono::steady_clock::now() + kHeadersResponseTimeout;
+          now + kHeadersResponseTimeout;
     }
   }
   if (!session->Send(net::messages::EncodeGetHeaders(request))) {
@@ -1658,6 +1705,10 @@ void BlockSyncManager::StallWatcher(std::stop_token stop) {
     bool backpressure_was_active = header_backpressure_active_.load();
     bool should_resume_headers = false;
     std::vector<std::pair<net::PeerManager::PeerInfo, std::shared_ptr<net::PeerSession>>> peers_to_resume;
+    std::optional<std::pair<net::PeerManager::PeerInfo, std::shared_ptr<net::PeerSession>>> sync_tick_peer;
+    bool trigger_sync_recovery = false;
+    std::size_t stall_gap = 0;
+    std::size_t stall_queue = 0;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       // Proactively prune headers that are no longer needed to prevent
@@ -1696,6 +1747,7 @@ void BlockSyncManager::StallWatcher(std::stop_token stop) {
       for (auto it = inflight_blocks_.begin(); it != inflight_blocks_.end();) {
         const auto& entry = it->second;
         if (now - entry.assigned_at > kBlockRequestTimeout) {
+          inflight_block_timeouts_total_.fetch_add(1);
           stalled.emplace_back(entry.peer_id, entry.hash);
           auto it_worker = peer_workers_.find(entry.peer_id);
           if (it_worker != peer_workers_.end()) {
@@ -1729,12 +1781,60 @@ void BlockSyncManager::StallWatcher(std::stop_token stop) {
         it = inflight_transactions_.erase(it);
       }
       stalls_detected_.fetch_add(stalled.size());
+
+      // Check for sync stall: headers ahead but no block progress. This can
+      // happen when header recovery is blocked and no block requests are in
+      // flight, leaving the node stuck with a persistent headers gap.
+      const auto chain_height = chain_.Height();
+      const auto gap =
+          best_header_height_ > chain_height ? (best_header_height_ - chain_height) : 0;
+
+      if (last_sync_tick_.time_since_epoch().count() == 0 ||
+          now - last_sync_tick_ >= std::chrono::seconds(60)) {
+        const auto since_progress = now - last_block_progress_time_;
+        std::size_t active_outbound = 0;
+        for (const auto& kv : peer_workers_) {
+          const auto& worker = kv.second;
+          if (!worker.info.inbound && worker.session) {
+            ++active_outbound;
+          }
+        }
+        const bool needs_tick =
+            (gap > 0) ||
+            (since_progress > std::chrono::seconds(120)) ||
+            (active_outbound < 2);
+        if (needs_tick) {
+          last_sync_tick_ = now;
+          for (const auto& kv : peer_workers_) {
+            const auto& worker = kv.second;
+            if (!worker.info.inbound && worker.session) {
+              sync_tick_peer.emplace(worker.info, worker.session);
+              break;
+            }
+          }
+        }
+      }
+
+      if (gap > 0 && inflight_blocks_.empty() && !download_queue_.empty()) {
+        const auto since_progress = now - last_block_progress_time_;
+        if (since_progress > std::chrono::seconds(30)) {
+          block_stall_recoveries_total_.fetch_add(1);
+          last_block_progress_time_ = now;
+          trigger_sync_recovery = true;
+          stall_gap = gap;
+          stall_queue = download_queue_.size();
+        }
+      }
     }
     // Apply small ban scores and try to reassign work.
     for (const auto& item : stalled) {
       peers_.AddBanScore(item.first, 1);
     }
-    if (!stalled.empty()) {
+    if (trigger_sync_recovery) {
+      std::cerr << "[sync] detected sync stall: gap=" << stall_gap
+                << ", queue=" << stall_queue << ", triggering recovery\n";
+    }
+    if (!stalled.empty() || trigger_sync_recovery) {
       RequestFromAnyPeer();
     }
     // Resume header requests for peers if backpressure cleared
@@ -1742,6 +1842,10 @@ void BlockSyncManager::StallWatcher(std::stop_token stop) {
       for (const auto& [info, session] : peers_to_resume) {
         SendGetHeaders(info, session);
       }
+    }
+    if (sync_tick_peer.has_value()) {
+      const auto& [info, session] = *sync_tick_peer;
+      SendGetHeaders(info, session);
     }
   }
 }

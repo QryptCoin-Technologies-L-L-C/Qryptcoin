@@ -227,6 +227,7 @@ if(BUILD_TESTING)
   file(GLOB_RECURSE QRY_TEST_SOURCES CONFIGURE_DEPENDS
     tests/unit/*.cpp
     tests/integration/*.cpp
+    tests/node/*.cpp
   )
   foreach(test_src IN LISTS QRY_TEST_SOURCES)
     file(RELATIVE_PATH rel_src ${CMAKE_SOURCE_DIR}/tests ${test_src})

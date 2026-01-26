@@ -749,7 +749,12 @@ nlohmann::json RpcServer::HandleGetBlockchainInfo(const nlohmann::json&) const {
   if (has_sync) {
     nlohmann::json sync_json;
     sync_json["pending_blocks"] = sync_stats.pending_blocks;
+    sync_json["headers_gap"] = sync_stats.headers_gap;
+    sync_json["active_outbound_peers"] = sync_stats.active_outbound_peers;
     sync_json["stalls_detected"] = sync_stats.stalls_detected;
+    sync_json["block_stall_recoveries"] = sync_stats.block_stall_recoveries;
+    sync_json["inflight_block_timeouts"] = sync_stats.inflight_block_timeouts;
+    sync_json["unsolicited_headers_ignored"] = sync_stats.unsolicited_headers_ignored;
     sync_json["getheaders_sent"] = sync_stats.getheaders_sent;
     sync_json["headers_received"] = sync_stats.headers_received;
     sync_json["inventories_received"] = sync_stats.inventories_received;
