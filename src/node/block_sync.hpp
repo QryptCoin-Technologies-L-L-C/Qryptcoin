@@ -145,6 +145,8 @@ class BlockSyncManager {
   std::optional<std::size_t> ParentHeightLocked(const primitives::Hash256& hash) const;
   void RebuildDownloadQueueLocked();
   void RemoveHeaderEntryLocked(const primitives::Hash256& hash);
+  void PruneStaleHeadersLocked();
+  void RemoveHeadersForPeerLocked(std::uint64_t peer_id);
   void StoreOrphanBlockLocked(const primitives::Hash256& hash,
                               primitives::CBlock block,
                               std::size_t payload_bytes);

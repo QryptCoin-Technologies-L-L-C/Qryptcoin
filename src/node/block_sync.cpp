@@ -309,6 +309,8 @@ void BlockSyncManager::OnPeerDisconnected(const net::PeerManager::PeerInfo& info
       }
       peer_workers_.erase(it);
     }
+    // Clean up headers contributed by this peer to free capacity for active peers.
+    RemoveHeadersForPeerLocked(info.id);
     for (auto it_block = inflight_blocks_.begin(); it_block != inflight_blocks_.end();) {
       if (it_block->second.peer_id == info.id) {
         to_requeue.push_back(it_block->second.hash);
@@ -1149,6 +1151,26 @@ void BlockSyncManager::HandleTransaction(const net::PeerManager::PeerInfo& info,
 void BlockSyncManager::SendGetHeaders(const net::PeerManager::PeerInfo& info,
                                       const std::shared_ptr<net::PeerSession>& session) {
   if (!running_) return;
+  // Apply backpressure: don't request more headers if we already have a large
+  // gap between best_header_height and the chain tip, or if the header storage
+  // is getting full. This prevents "exceeded header storage caps" errors.
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto chain_height = chain_.Height();
+    const auto gap =
+        best_header_height_ > chain_height ? (best_header_height_ - chain_height) : 0;
+    // Don't request more headers if we're already 2000+ blocks ahead
+    if (gap >= kMaxHeadersPerRequest) {
+      return;
+    }
+    // Also check if header storage is getting close to limits
+    const auto peer_headers = headers_by_peer_.count(info.id) ? headers_by_peer_.at(info.id) : 0;
+    if (peer_headers + kMaxHeadersPerRequest > kMaxStoredHeadersPerPeer ||
+        header_index_.size() + kMaxHeadersPerRequest > kMaxStoredHeadersTotal) {
+      // Storage is getting full, let block downloads catch up first
+      return;
+    }
+  }
   getheaders_sent_.fetch_add(1);
   net::messages::GetHeadersMessage request;
   request.locators = BuildLocator();
@@ -1341,6 +1363,71 @@ void BlockSyncManager::RemoveHeaderEntryLocked(const primitives::Hash256& hash) 
   }
 }
 
+void BlockSyncManager::PruneStaleHeadersLocked() {
+  // Remove headers that are already in the chain (below or at the tip).
+  // This prevents header accumulation when block downloads are slow.
+  const auto chain_height = chain_.Height();
+  std::vector<std::string> to_remove;
+  to_remove.reserve(header_index_.size() / 2);
+
+  for (const auto& kv : header_index_) {
+    const auto& entry = kv.second;
+    // If the header is at or below the chain tip, it's either already
+    // connected or on a stale branch. Either way, we don't need it.
+    if (entry.height <= chain_height) {
+      to_remove.push_back(kv.first);
+      continue;
+    }
+    // If the header's source peer is no longer connected, clean it up
+    // to free capacity for active peers.
+    if (peer_workers_.find(entry.source_peer_id) == peer_workers_.end()) {
+      to_remove.push_back(kv.first);
+      continue;
+    }
+  }
+
+  for (const auto& hex : to_remove) {
+    auto it = header_index_.find(hex);
+    if (it == header_index_.end()) {
+      continue;
+    }
+    const auto source_peer = it->second.source_peer_id;
+    header_index_.erase(it);
+    auto it_count = headers_by_peer_.find(source_peer);
+    if (it_count != headers_by_peer_.end()) {
+      if (it_count->second > 0) {
+        it_count->second -= 1;
+      }
+      if (it_count->second == 0) {
+        headers_by_peer_.erase(it_count);
+      }
+    }
+  }
+
+  if (!to_remove.empty()) {
+    std::cerr << "[sync] pruned " << to_remove.size() << " stale headers (chain_height="
+              << chain_height << ", remaining=" << header_index_.size() << ")\n";
+  }
+}
+
+void BlockSyncManager::RemoveHeadersForPeerLocked(std::uint64_t peer_id) {
+  // Remove all headers contributed by a disconnected peer.
+  std::vector<std::string> to_remove;
+  for (const auto& kv : header_index_) {
+    if (kv.second.source_peer_id == peer_id) {
+      to_remove.push_back(kv.first);
+    }
+  }
+  for (const auto& hex : to_remove) {
+    header_index_.erase(hex);
+  }
+  headers_by_peer_.erase(peer_id);
+  if (!to_remove.empty()) {
+    std::cerr << "[sync] removed " << to_remove.size() << " headers from disconnected peer "
+              << peer_id << "\n";
+  }
+}
+
 bool BlockSyncManager::PrepareBlockRequestForPeerLocked(std::uint64_t peer_id,
                                                         primitives::Hash256* out_hash) {
   if (!out_hash) return false;
@@ -1439,6 +1526,9 @@ void BlockSyncManager::StallWatcher(std::stop_token stop) {
     std::vector<std::pair<std::uint64_t, primitives::Hash256>> stalled;
     {
       std::lock_guard<std::mutex> lock(mutex_);
+      // Proactively prune headers that are no longer needed to prevent
+      // "exceeded header storage caps" errors during slow block downloads.
+      PruneStaleHeadersLocked();
       const auto now = clock::now();
       for (auto it = inflight_blocks_.begin(); it != inflight_blocks_.end();) {
         const auto& entry = it->second;
