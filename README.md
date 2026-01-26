@@ -111,3 +111,4 @@ ctest --test-dir build --output-on-failure
 ## License
 
 Source code is licensed under the MIT license: `LICENSE`.
+
