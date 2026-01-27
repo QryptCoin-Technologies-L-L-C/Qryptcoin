@@ -36,29 +36,14 @@ jobs:
       - name: Generate report
         run: |
           set -euo pipefail
-          gcovr --root . \
-            --object-directory build-coverage \
-            --exclude 'build-coverage/.*' \
-            --exclude 'tests/.*' \
-            --exclude 'third_party/.*' \
-            --exclude 'vendor/.*' \
-            --print-summary | tee build-coverage/coverage-summary.txt
+          GCOVR_OPTS="--root . --object-directory build-coverage \
+            --exclude 'build-coverage/.*' --exclude 'tests/.*' \
+            --exclude 'third_party/.*' --exclude 'vendor/.*' \
+            --gcov-ignore-errors=source_not_found,no_working_dir_found"
 
-          gcovr --root . \
-            --object-directory build-coverage \
-            --exclude 'build-coverage/.*' \
-            --exclude 'tests/.*' \
-            --exclude 'third_party/.*' \
-            --exclude 'vendor/.*' \
-            --xml-pretty -o build-coverage/coverage.xml
-
-          gcovr --root . \
-            --object-directory build-coverage \
-            --exclude 'build-coverage/.*' \
-            --exclude 'tests/.*' \
-            --exclude 'third_party/.*' \
-            --exclude 'vendor/.*' \
-            --html-details -o build-coverage/coverage.html
+          gcovr $GCOVR_OPTS --print-summary | tee build-coverage/coverage-summary.txt
+          gcovr $GCOVR_OPTS --xml-pretty -o build-coverage/coverage.xml
+          gcovr $GCOVR_OPTS --html-details -o build-coverage/coverage.html
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
