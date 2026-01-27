@@ -553,6 +553,17 @@ void ApplyEnvironmentOverrides(Options* opts) {
   if (auto value = GetEnvValue("QRY_LOG_MAX_FILES")) {
     opts->log_max_files = static_cast<std::size_t>(std::stoul(*value));
   }
+
+  // Peer connection limits (environment variable overrides).
+  if (auto value = GetEnvValue("QRY_MAX_INBOUND_PEERS")) {
+    opts->max_inbound_peers = static_cast<std::size_t>(std::stoul(*value));
+  }
+  if (auto value = GetEnvValue("QRY_MAX_OUTBOUND_PEERS")) {
+    opts->max_outbound_peers = static_cast<std::size_t>(std::stoul(*value));
+  }
+  if (auto value = GetEnvValue("QRY_MAX_TOTAL_PEERS")) {
+    opts->max_total_peers = static_cast<std::size_t>(std::stoul(*value));
+  }
 }
 
 std::string NormalizeKey(std::string key) {

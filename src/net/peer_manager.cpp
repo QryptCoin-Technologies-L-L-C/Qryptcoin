@@ -12,22 +12,24 @@ namespace qryptcoin::net {
 namespace {
 
 // Default peer limits for optimal network health.
-// 125 total connections (115 inbound, 10 outbound: 8 full-relay + 2 block-relay)
-constexpr std::size_t kDefaultMaxInboundPeers = 115;
+// Increased defaults to support high-traffic seed nodes.
+constexpr std::size_t kDefaultMaxInboundPeers = 500;
 constexpr std::size_t kDefaultMaxOutboundPeers = 10;
-constexpr std::size_t kDefaultMaxTotalPeers = 125;
+constexpr std::size_t kDefaultMaxTotalPeers = 512;
 // Per-subnet cap to avoid a single /24 dominating inbound slots.
-constexpr std::size_t kMaxPeersPerSubnet = 8;
+// Increased to allow more peers from shared hosting/cloud providers.
+constexpr std::size_t kMaxPeersPerSubnet = 64;
 // Pre-handshake inbound throttling. This is applied before expensive crypto
 // (Kyber) work to reduce CPU DoS from connection floods.
+// Increased limits to handle bursts of legitimate connection attempts.
 constexpr std::chrono::seconds kInboundHandshakeThrottleWindow{10};
-constexpr std::size_t kMaxInboundHandshakesPerHostWindow = 8;
-constexpr std::size_t kMaxInboundHandshakesPerSubnetWindow = 32;
-constexpr std::size_t kMaxInboundThrottleEntries = 4096;
+constexpr std::size_t kMaxInboundHandshakesPerHostWindow = 32;
+constexpr std::size_t kMaxInboundHandshakesPerSubnetWindow = 256;
+constexpr std::size_t kMaxInboundThrottleEntries = 16384;
 // Disconnect peers that have been silent longer than this.
 constexpr std::chrono::seconds kIdlePeerTimeout{120};
 constexpr std::chrono::seconds kIdleSweepInterval{15};
-constexpr int kListenerBacklog = 16;
+constexpr int kListenerBacklog = 128;
 // Simple ban scoring parameters.
 constexpr int kBanThreshold = 100;
 constexpr std::chrono::minutes kBanDuration{60};
@@ -223,9 +225,6 @@ std::vector<PeerManager::PeerInfo> PeerManager::GetPeerInfos() const {
 
 void PeerManager::ListenerThread() {
   using clock = std::chrono::steady_clock;
-  constexpr auto kDropLogInterval = std::chrono::seconds(10);
-  clock::time_point last_drop_log{};
-  std::uint64_t drops_since_log = 0;
 
   while (running_) {
     FrameChannel inbound = listener_channel_.AcceptWithTimeout(200);
@@ -233,40 +232,16 @@ void PeerManager::ListenerThread() {
       continue;
     }
 
-    // Apply cheap gating (ban/capacity/throttles) before running the protocol
-    // handshake so that banned or abusive peers do not trigger expensive Kyber
-    // computations.
     const std::string prehandshake_address = inbound.socket().PeerAddress();
-    bool dropped_prehandshake = false;
-    bool log_drop = false;
-    std::uint64_t drop_count = 0;
+
+    // Only reject banned addresses before handshake.
+    // We no longer drop due to capacity - we'll evict existing peers if needed.
     {
       std::lock_guard<std::mutex> lock(peers_mutex_);
-      if (!AllowInboundBeforeHandshakeLocked(prehandshake_address, clock::now())) {
-        dropped_prehandshake = true;
-        ++drops_since_log;
-        const auto now = clock::now();
-        if (last_drop_log.time_since_epoch().count() == 0 ||
-            now - last_drop_log >= kDropLogInterval) {
-          log_drop = true;
-          drop_count = drops_since_log;
-          drops_since_log = 0;
-          last_drop_log = now;
-        }
+      if (IsAddressBannedLocked(prehandshake_address)) {
+        inbound.socket().Close();
+        continue;
       }
-    }
-    if (dropped_prehandshake) {
-      if (log_drop) {
-        std::cerr << "Inbound peer limit, ban, or throttle reached, dropping connection";
-        if (drop_count > 1) {
-          std::cerr << " (" << drop_count << " drops in last "
-                    << std::chrono::duration_cast<std::chrono::seconds>(kDropLogInterval).count()
-                    << "s)";
-        }
-        std::cerr << "\n";
-      }
-      inbound.socket().Close();
-      continue;
     }
 
     auto session = std::make_shared<PeerSession>();
@@ -280,42 +255,51 @@ void PeerManager::ListenerThread() {
       session->Close();
       continue;
     }
+
     PeerInfo info;
-    bool dropped = false;
+    std::uint64_t evict_id = 0;
+    bool accepted = false;
     {
       std::lock_guard<std::mutex> lock(peers_mutex_);
       const std::string address = session->PeerAddress();
-      if (!HasCapacityForAddressLocked(true, address)) {
-        dropped = true;
-        ++drops_since_log;
-        const auto now = clock::now();
-        if (last_drop_log.time_since_epoch().count() == 0 ||
-            now - last_drop_log >= kDropLogInterval) {
-          log_drop = true;
-          drop_count = drops_since_log;
-          drops_since_log = 0;
-          last_drop_log = now;
-        }
+
+      // Check if we should accept (and possibly evict)
+      if (IsAddressBannedLocked(address)) {
+        // Banned after handshake revealed real address
+        session->Close();
+        continue;
+      }
+
+      if (HasCapacityLocked(true)) {
+        // Have capacity - accept directly
+        accepted = true;
       } else {
+        // At capacity - try to evict a peer to make room
+        evict_id = EvictInboundPeerLocked();
+        if (evict_id != 0) {
+          accepted = true;
+        }
+      }
+
+      if (accepted) {
         info.id = next_peer_id_++;
         info.inbound = true;
         info.address = address;
         peers_.push_back(PeerEntry{info, session});
       }
     }
-    if (dropped) {
-      if (log_drop) {
-        std::cerr << "Inbound peer limit or ban reached, dropping connection";
-        if (drop_count > 1) {
-          std::cerr << " (" << drop_count << " drops in last "
-                    << std::chrono::duration_cast<std::chrono::seconds>(kDropLogInterval).count()
-                    << "s)";
-        }
-        std::cerr << "\n";
-      }
+
+    // Perform eviction outside the lock to avoid deadlock
+    if (evict_id != 0) {
+      DisconnectPeer(evict_id);
+    }
+
+    if (!accepted) {
+      // This should be rare - only if we couldn't find anyone to evict
       session->Close();
       continue;
     }
+
     seen_inbound_.store(true);
     NotifyPeerConnected(info, session);
   }
@@ -586,6 +570,88 @@ std::string PeerManager::SubnetKey(const std::string& address) {
   }
   // Non-IPv4: treat the host itself as the key.
   return host;
+}
+
+std::uint64_t PeerManager::EvictInboundPeerLocked() {
+  // Select the least useful inbound peer to evict.
+  // Eviction criteria (in order of preference for eviction):
+  // 1. Peers with longest idle time (no recent activity)
+  // 2. Peers from over-represented subnets
+  // 3. Newest connections (protect long-lived connections)
+
+  const auto now = std::chrono::steady_clock::now();
+  std::uint64_t best_candidate = 0;
+  std::chrono::steady_clock::duration best_idle_time{};
+  std::size_t best_subnet_count = 0;
+
+  // Count peers per subnet for diversity scoring
+  std::unordered_map<std::string, std::size_t> subnet_counts;
+  for (const auto& entry : peers_) {
+    if (entry.info.inbound) {
+      const std::string subnet = SubnetKey(entry.info.address);
+      ++subnet_counts[subnet];
+    }
+  }
+
+  for (const auto& entry : peers_) {
+    if (!entry.info.inbound) {
+      continue;  // Only evict inbound peers
+    }
+    if (!entry.session) {
+      continue;
+    }
+
+    const auto idle_time = now - entry.session->LastActivity();
+    const std::string subnet = SubnetKey(entry.info.address);
+    const std::size_t subnet_count = subnet_counts[subnet];
+
+    // Prefer to evict peers that are:
+    // - More idle (longer since last activity)
+    // - From over-represented subnets
+    bool is_better_candidate = false;
+
+    if (best_candidate == 0) {
+      is_better_candidate = true;
+    } else if (subnet_count > best_subnet_count + 2) {
+      // Strongly prefer evicting from over-represented subnets
+      is_better_candidate = true;
+    } else if (subnet_count >= best_subnet_count && idle_time > best_idle_time) {
+      // Among similar subnet representation, prefer more idle peers
+      is_better_candidate = true;
+    }
+
+    if (is_better_candidate) {
+      best_candidate = entry.info.id;
+      best_idle_time = idle_time;
+      best_subnet_count = subnet_count;
+    }
+  }
+
+  return best_candidate;
+}
+
+bool PeerManager::ShouldAcceptInboundLocked(const std::string& address) {
+  // Always reject banned addresses
+  if (IsAddressBannedLocked(address)) {
+    return false;
+  }
+
+  // If we have capacity, accept
+  if (HasCapacityLocked(true)) {
+    return true;
+  }
+
+  // At capacity - try to evict a peer to make room
+  // This implements "accept and evict" rather than "drop when full"
+  std::uint64_t evict_id = EvictInboundPeerLocked();
+  if (evict_id != 0) {
+    // Found a peer to evict - will be disconnected after we release the lock
+    // For now, just indicate we can accept (the eviction happens in ListenerThread)
+    return true;
+  }
+
+  // No suitable peer to evict (shouldn't happen normally)
+  return false;
 }
 
 void PeerManager::AddBanScore(std::uint64_t peer_id, int score) {

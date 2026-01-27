@@ -87,6 +87,13 @@ class PeerManager {
   bool IsAddressBannedLocked(const std::string& address) const;
   bool AllowInboundBeforeHandshakeLocked(const std::string& address,
                                         std::chrono::steady_clock::time_point now);
+  // Evict the least useful inbound peer to make room for a new connection.
+  // Returns the evicted peer's ID, or 0 if no peer could be evicted.
+  std::uint64_t EvictInboundPeerLocked();
+  // Decide whether to accept a new inbound connection, potentially evicting
+  // an existing peer if at capacity. Returns true if the connection should
+  // be accepted.
+  bool ShouldAcceptInboundLocked(const std::string& address);
   static std::string ExtractHost(const std::string& address);
   static std::string SubnetKey(const std::string& address);
 
