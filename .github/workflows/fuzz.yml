@@ -1,0 +1,59 @@
+name: Fuzz
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz-smoke:
+    name: Fuzz smoke (libFuzzer)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ninja-build
+
+      - name: Configure
+        run: |
+          cmake -S . -B build-fuzz -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DBUILD_TESTING=OFF \
+            -DQRY_BUILD_BINARIES=OFF \
+            -DBUILD_FUZZING=ON \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Build
+        run: cmake --build build-fuzz --parallel
+
+      - name: Run fuzzers (short)
+        run: |
+          set -euo pipefail
+          mkdir -p build-fuzz/artifacts
+          shopt -s nullglob
+          fuzzers=(build-fuzz/qrypt_fuzz_*)
+          if [ ${#fuzzers[@]} -eq 0 ]; then
+            echo "No fuzz targets built."
+            exit 0
+          fi
+          for f in "${fuzzers[@]}"; do
+            echo "Running ${f}"
+            "${f}" -max_total_time=30 -artifact_prefix=build-fuzz/artifacts/
+          done
+
+      - name: Upload fuzz artifacts (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: build-fuzz/artifacts/
+

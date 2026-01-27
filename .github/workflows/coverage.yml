@@ -1,0 +1,73 @@
+name: Coverage
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    name: Test coverage (gcovr)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install gcovr
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install gcovr
+
+      - name: Configure
+        run: |
+          cmake -S . -B build-coverage \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_FLAGS=--coverage \
+            -DCMAKE_CXX_FLAGS=--coverage \
+            -DCMAKE_EXE_LINKER_FLAGS=--coverage \
+            -DCMAKE_SHARED_LINKER_FLAGS=--coverage
+
+      - name: Build
+        run: cmake --build build-coverage --parallel
+
+      - name: Test
+        run: ctest --test-dir build-coverage --output-on-failure
+
+      - name: Generate report
+        run: |
+          set -euo pipefail
+          gcovr --root . \
+            --object-directory build-coverage \
+            --exclude 'build-coverage/.*' \
+            --exclude 'tests/.*' \
+            --exclude 'third_party/.*' \
+            --exclude 'vendor/.*' \
+            --print-summary | tee build-coverage/coverage-summary.txt
+
+          gcovr --root . \
+            --object-directory build-coverage \
+            --exclude 'build-coverage/.*' \
+            --exclude 'tests/.*' \
+            --exclude 'third_party/.*' \
+            --exclude 'vendor/.*' \
+            --xml-pretty -o build-coverage/coverage.xml
+
+          gcovr --root . \
+            --object-directory build-coverage \
+            --exclude 'build-coverage/.*' \
+            --exclude 'tests/.*' \
+            --exclude 'third_party/.*' \
+            --exclude 'vendor/.*' \
+            --html-details -o build-coverage/coverage.html
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            build-coverage/coverage-summary.txt
+            build-coverage/coverage.xml
+            build-coverage/coverage.html
+

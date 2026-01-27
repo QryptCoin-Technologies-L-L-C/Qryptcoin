@@ -78,3 +78,49 @@ cmake -S . -B build -A x64
 cmake --build build --config Release --parallel
 ctest --test-dir build -C Release --output-on-failure
 ```
+
+## SBOM
+
+- Generate an SBOM locally (or verify the CI artifact):
+
+```sh
+docker run --rm -v "$PWD:/src" -w /src anchore/syft:latest dir:/src -o cyclonedx-json=sbom.cdx.json
+docker run --rm -v "$PWD:/src" -w /src anchore/syft:latest dir:/src -o spdx-json=sbom.spdx.json
+```
+
+See `docs/security/sbom.md` and `.github/workflows/sbom.yml`.
+
+## Fuzzing (smoke)
+
+- Build and run fuzzers briefly to catch obvious parser crashes:
+
+```sh
+cmake -S . -B build-fuzz -G Ninja \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DBUILD_TESTING=OFF \
+  -DQRY_BUILD_BINARIES=OFF \
+  -DBUILD_FUZZING=ON \
+  -DCMAKE_C_COMPILER=clang \
+  -DCMAKE_CXX_COMPILER=clang++
+cmake --build build-fuzz --parallel
+for f in build-fuzz/qrypt_fuzz_*; do "$f" -max_total_time=30; done
+```
+
+See `docs/security/fuzzing.md` and `.github/workflows/fuzz.yml`.
+
+## Coverage
+
+- Generate a coverage report (Linux/GCC) and review changes to critical paths:
+
+```sh
+cmake -S . -B build-coverage -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_C_FLAGS=--coverage \
+  -DCMAKE_CXX_FLAGS=--coverage \
+  -DCMAKE_EXE_LINKER_FLAGS=--coverage \
+  -DCMAKE_SHARED_LINKER_FLAGS=--coverage
+cmake --build build-coverage --parallel
+ctest --test-dir build-coverage --output-on-failure
+gcovr --root . --object-directory build-coverage --print-summary
+```
+
+See `docs/testing.md` and `.github/workflows/coverage.yml`.

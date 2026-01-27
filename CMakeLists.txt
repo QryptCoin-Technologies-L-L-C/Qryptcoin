@@ -12,6 +12,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 include(CTest)
 
+option(QRY_BUILD_BINARIES "Build node/CLI executables" ON)
+option(BUILD_FUZZING "Build libFuzzer fuzz targets (Clang)" OFF)
+
 if(WIN32)
   add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
@@ -201,24 +204,26 @@ endif()
 
 # --- Node daemon ------------------------------------------------------------
 
-add_executable(qryptd src/node/qryptd.cpp)
-target_link_libraries(qryptd PRIVATE qryptcore)
-if(WIN32)
-  target_link_libraries(qryptd PRIVATE Advapi32)
-endif()
+if(QRY_BUILD_BINARIES)
+  add_executable(qryptd src/node/qryptd.cpp)
+  target_link_libraries(qryptd PRIVATE qryptcore)
+  if(WIN32)
+    target_link_libraries(qryptd PRIVATE Advapi32)
+  endif()
 
 # --- CLI tools --------------------------------------------------------------
 
-add_executable(qrypt-cli tools/qrypt_cli.cpp)
-target_link_libraries(qrypt-cli PRIVATE qryptcore)
-if(WIN32)
-  target_link_libraries(qrypt-cli PRIVATE Advapi32)
-endif()
+  add_executable(qrypt-cli tools/qrypt_cli.cpp)
+  target_link_libraries(qrypt-cli PRIVATE qryptcore)
+  if(WIN32)
+    target_link_libraries(qrypt-cli PRIVATE Advapi32)
+  endif()
 
-add_executable(qrypt-payresolver tools/qrypt_payresolver.cpp)
-target_link_libraries(qrypt-payresolver PRIVATE qryptcore)
-if(WIN32)
-  target_link_libraries(qrypt-payresolver PRIVATE Advapi32)
+  add_executable(qrypt-payresolver tools/qrypt_payresolver.cpp)
+  target_link_libraries(qrypt-payresolver PRIVATE qryptcore)
+  if(WIN32)
+    target_link_libraries(qrypt-payresolver PRIVATE Advapi32)
+  endif()
 endif()
 
 # --- Tests ------------------------------------------------------------------
@@ -242,10 +247,43 @@ if(BUILD_TESTING)
   endforeach()
 endif()
 
+# --- Fuzzing ----------------------------------------------------------------
+
+if(BUILD_FUZZING)
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "BUILD_FUZZING requires Clang (libFuzzer).")
+  endif()
+  if(MSVC)
+    message(FATAL_ERROR "BUILD_FUZZING is currently supported on Clang-based toolchains only.")
+  endif()
+
+  # Instrument QryptCoin code for coverage-guided fuzzing. Vendor dependencies
+  # are left untouched to keep the fuzz build surface minimal.
+  target_compile_options(qryptcore PRIVATE -fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer)
+
+  file(GLOB_RECURSE QRY_FUZZ_SOURCES CONFIGURE_DEPENDS
+    tests/fuzz/*.cpp
+  )
+  foreach(fuzz_src IN LISTS QRY_FUZZ_SOURCES)
+    file(RELATIVE_PATH rel_src ${CMAKE_SOURCE_DIR}/tests/fuzz ${fuzz_src})
+    string(REPLACE "/" "_" rel_name ${rel_src})
+    string(REPLACE "\\" "_" rel_name ${rel_name})
+    string(REPLACE ".cpp" "" rel_name ${rel_name})
+    set(target_name "qrypt_fuzz_${rel_name}")
+    add_executable(${target_name} ${fuzz_src})
+    target_link_libraries(${target_name} PRIVATE qryptcore)
+    target_include_directories(${target_name} PRIVATE ${CMAKE_SOURCE_DIR})
+    target_compile_options(${target_name} PRIVATE -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer)
+    target_link_options(${target_name} PRIVATE -fsanitize=fuzzer,address,undefined)
+  endforeach()
+endif()
+
 # --- Install / Packaging ----------------------------------------------------
 
-install(TARGETS qryptd qrypt-cli qrypt-payresolver
-        RUNTIME DESTINATION bin)
+if(QRY_BUILD_BINARIES)
+  install(TARGETS qryptd qrypt-cli qrypt-payresolver
+          RUNTIME DESTINATION bin)
+endif()
 
 set(CPACK_PACKAGE_NAME "qryptcoin-core")
 set(CPACK_PACKAGE_VENDOR "QryptCoin Technologies LLC")

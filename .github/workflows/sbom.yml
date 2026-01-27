@@ -1,0 +1,32 @@
+name: SBOM
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    name: Generate SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate SBOM (CycloneDX + SPDX)
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/src" -w /src anchore/syft:latest dir:/src -o cyclonedx-json=sbom.cdx.json
+          docker run --rm -v "${{ github.workspace }}:/src" -w /src anchore/syft:latest dir:/src -o spdx-json=sbom.spdx.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: |
+            sbom.cdx.json
+            sbom.spdx.json
+

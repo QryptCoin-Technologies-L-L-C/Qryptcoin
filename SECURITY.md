@@ -17,3 +17,8 @@ Include as much detail as possible:
 ## Scope / Supported Versions
 
 Security fixes are tracked on the `main` branch. Tagged releases (when published) are supported according to their release notes.
+
+## Additional security documentation
+
+- Threat model: `docs/security/threat-model.md`
+- Incident response plan: `docs/security/incident-response-plan.md`

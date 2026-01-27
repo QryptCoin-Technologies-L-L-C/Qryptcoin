@@ -34,6 +34,24 @@ ctest --test-dir build -R qrypt_unit_ --output-on-failure
 ctest --test-dir build -R qrypt_integration_ --output-on-failure
 ```
 
+## Coverage
+
+Code coverage reporting is supported on Linux via GCC/GCov + `gcovr`.
+
+```bash
+cmake -S . -B build-coverage -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_C_FLAGS=--coverage \
+  -DCMAKE_CXX_FLAGS=--coverage \
+  -DCMAKE_EXE_LINKER_FLAGS=--coverage \
+  -DCMAKE_SHARED_LINKER_FLAGS=--coverage
+cmake --build build-coverage --parallel
+ctest --test-dir build-coverage --output-on-failure
+gcovr --root . --object-directory build-coverage --print-summary
+gcovr --root . --object-directory build-coverage --html-details -o build-coverage/coverage.html
+```
+
+CI also publishes a coverage artifact on pull requests (see `.github/workflows/coverage.yml`).
+
 ## Notes
 
 - Integration tests use temporary directories for on-disk state and clean them up on success.
