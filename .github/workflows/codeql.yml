@@ -8,6 +8,8 @@ on:
   schedule:
     - cron: "0 3 * * 1"
 
+permissions: read-all
+
 jobs:
   analyze:
     name: Analyze
@@ -19,10 +21,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
+        uses: github/codeql-action/init@ab28d5ce09b08e4700b2296d39d684a7ac71d1e7 # v4
         with:
           languages: cpp
           config-file: .github/codeql/codeql-config.yml
@@ -34,6 +36,6 @@ jobs:
         run: cmake --build build --parallel
 
       - name: Analyze
-        uses: github/codeql-action/analyze@v4
+        uses: github/codeql-action/analyze@ab28d5ce09b08e4700b2296d39d684a7ac71d1e7 # v4
         with:
           category: "/language:cpp"
