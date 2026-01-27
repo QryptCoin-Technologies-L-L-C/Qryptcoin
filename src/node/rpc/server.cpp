@@ -751,10 +751,17 @@ nlohmann::json RpcServer::HandleGetBlockchainInfo(const nlohmann::json&) const {
     sync_json["pending_blocks"] = sync_stats.pending_blocks;
     sync_json["headers_gap"] = sync_stats.headers_gap;
     sync_json["active_outbound_peers"] = sync_stats.active_outbound_peers;
+    sync_json["frontier_height"] = sync_stats.frontier_height;
+    sync_json["requestable_blocks_count"] = sync_stats.requestable_blocks;
+    sync_json["inflight_total"] = sync_stats.inflight_blocks;
+    sync_json["orphan_pool_size"] = sync_stats.orphan_pool_size;
     sync_json["stalls_detected"] = sync_stats.stalls_detected;
     sync_json["block_stall_recoveries"] = sync_stats.block_stall_recoveries;
     sync_json["inflight_block_timeouts"] = sync_stats.inflight_block_timeouts;
     sync_json["unsolicited_headers_ignored"] = sync_stats.unsolicited_headers_ignored;
+    sync_json["parent_ready_blocked_total"] = sync_stats.parent_ready_blocked;
+    sync_json["scheduler_no_requestable_cycles_total"] = sync_stats.scheduler_no_requestable_cycles;
+    sync_json["stall_breaker_activations_total"] = sync_stats.stall_breaker_activations;
     sync_json["getheaders_sent"] = sync_stats.getheaders_sent;
     sync_json["headers_received"] = sync_stats.headers_received;
     sync_json["inventories_received"] = sync_stats.inventories_received;

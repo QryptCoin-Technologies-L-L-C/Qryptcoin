@@ -43,9 +43,16 @@ bool SyncStatsHasHeaderMetrics() {
   }
   if (stats.headers_gap != 0 ||
       stats.active_outbound_peers != 0 ||
+      stats.frontier_height != 0 ||
+      stats.inflight_blocks != 0 ||
+      stats.requestable_blocks != 0 ||
+      stats.orphan_pool_size != 0 ||
       stats.block_stall_recoveries != 0 ||
       stats.inflight_block_timeouts != 0 ||
-      stats.unsolicited_headers_ignored != 0) {
+      stats.unsolicited_headers_ignored != 0 ||
+      stats.parent_ready_blocked != 0 ||
+      stats.scheduler_no_requestable_cycles != 0 ||
+      stats.stall_breaker_activations != 0) {
     std::cerr << "unexpected non-zero sync instrumentation defaults\n";
     return false;
   }

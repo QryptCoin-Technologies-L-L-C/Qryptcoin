@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <limits>
 #include <span>
 
 #include "consensus/block_hash.hpp"
@@ -83,6 +84,8 @@ void BlockSyncManager::Start() {
     const auto now = std::chrono::steady_clock::now();
     last_block_progress_time_ = now;
     last_sync_tick_ = now;
+    last_stall_recovery_time_ = std::chrono::steady_clock::time_point{};
+    last_stall_breaker_time_ = std::chrono::steady_clock::time_point{};
   }
   peers_.SetPeerConnectedHandler(
       [this](const net::PeerManager::PeerInfo& info,
@@ -156,10 +159,25 @@ BlockSyncManager::SyncStats BlockSyncManager::GetStats() const {
     stats.pending_blocks =
         download_queue_.size() + inflight_blocks_.size() + orphan_blocks_.size();
     stats.pending_headers = header_index_.size();
+    stats.frontier_height = best_header_height_ > chain_height ? (chain_height + 1) : 0;
+    stats.inflight_blocks = inflight_blocks_.size();
+    stats.orphan_pool_size = orphan_blocks_.size();
     for (const auto& kv : peer_workers_) {
       const auto& worker = kv.second;
       if (!worker.info.inbound && worker.session) {
         ++stats.active_outbound_peers;
+      }
+    }
+    for (const auto& hash : download_queue_) {
+      if (orphan_blocks_.find(hash) != orphan_blocks_.end()) {
+        continue;
+      }
+      const auto hex = HashToHex(hash);
+      if (inflight_blocks_.find(hex) != inflight_blocks_.end()) {
+        continue;
+      }
+      if (IsParentSatisfiedLocked(hash)) {
+        ++stats.requestable_blocks;
       }
     }
   }
@@ -172,6 +190,9 @@ BlockSyncManager::SyncStats BlockSyncManager::GetStats() const {
   stats.block_stall_recoveries = block_stall_recoveries_total_.load();
   stats.inflight_block_timeouts = inflight_block_timeouts_total_.load();
   stats.unsolicited_headers_ignored = unsolicited_headers_ignored_total_.load();
+  stats.parent_ready_blocked = parent_ready_blocked_total_.load();
+  stats.scheduler_no_requestable_cycles = scheduler_no_requestable_cycles_total_.load();
+  stats.stall_breaker_activations = stall_breaker_activations_total_.load();
   stats.headers_pruned_total = headers_pruned_total_.load();
   stats.headers_dropped_duplicate = headers_dropped_duplicate_.load();
   stats.getheaders_paused_backpressure = getheaders_paused_backpressure_.load();
@@ -1283,40 +1304,43 @@ void BlockSyncManager::SendGetHeaders(const net::PeerManager::PeerInfo& info,
 }
 
 void BlockSyncManager::RequestNextBlock(const net::PeerManager::PeerInfo& info,
-                                        const std::shared_ptr<net::PeerSession>& session) {
-  primitives::Hash256 next{};
-  bool should_send = false;
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!running_) {
-      return;
-    }
-    if (!PrepareBlockRequestForPeerLocked(info.id, &next)) {
-      return;
-    }
-    should_send = true;
+                                         const std::shared_ptr<net::PeerSession>& session) {
+  if (!session) {
+    return;
   }
-  if (!should_send) return;
-  net::messages::InventoryMessage inv;
-  net::messages::InventoryVector vec;
-  vec.type = net::messages::InventoryType::kBlock;
-  vec.identifier = ToInventoryId(next);
-  inv.entries.push_back(vec);
-  if (!session->Send(net::messages::EncodeGetData(inv))) {
-    std::cerr << "[sync] failed to request block from peer " << info.id << "\n";
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto hex = HashToHex(next);
-    auto it = inflight_blocks_.find(hex);
-    if (it != inflight_blocks_.end()) {
-      auto it_worker = peer_workers_.find(info.id);
-      if (it_worker != peer_workers_.end() &&
-          it_worker->second.inflight_blocks > 0) {
-        --it_worker->second.inflight_blocks;
+  while (true) {
+    primitives::Hash256 next{};
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!running_) {
+        return;
       }
-      inflight_blocks_.erase(it);
+      if (!PrepareBlockRequestForPeerLocked(info.id, &next)) {
+        return;
+      }
     }
-    if (download_queue_hashes_.insert(next).second) {
-      download_queue_.push_front(next);
+    net::messages::InventoryMessage inv;
+    net::messages::InventoryVector vec;
+    vec.type = net::messages::InventoryType::kBlock;
+    vec.identifier = ToInventoryId(next);
+    inv.entries.push_back(vec);
+    if (!session->Send(net::messages::EncodeGetData(inv))) {
+      std::cerr << "[sync] failed to request block from peer " << info.id << "\n";
+      std::lock_guard<std::mutex> lock(mutex_);
+      const auto hex = HashToHex(next);
+      auto it = inflight_blocks_.find(hex);
+      if (it != inflight_blocks_.end()) {
+        auto it_worker = peer_workers_.find(info.id);
+        if (it_worker != peer_workers_.end() &&
+            it_worker->second.inflight_blocks > 0) {
+          --it_worker->second.inflight_blocks;
+        }
+        inflight_blocks_.erase(it);
+      }
+      if (download_queue_hashes_.insert(next).second) {
+        download_queue_.push_front(next);
+      }
+      return;
     }
   }
 }
@@ -1392,6 +1416,31 @@ std::optional<std::size_t> BlockSyncManager::ParentHeightLocked(
     return it->second.height;
   }
   return std::nullopt;
+}
+
+bool BlockSyncManager::IsParentSatisfiedLocked(const primitives::Hash256& candidate) const {
+  const auto candidate_hex = HashToHex(candidate);
+  const auto it_header = header_index_.find(candidate_hex);
+  if (it_header == header_index_.end()) {
+    return false;
+  }
+  const auto parent = it_header->second.previous;
+  const bool parent_all_zero =
+      std::all_of(parent.begin(), parent.end(), [](std::uint8_t b) { return b == 0; });
+  if (parent_all_zero) {
+    return true;
+  }
+  const auto parent_hex = HashToHex(parent);
+  if (parent_hex.empty()) {
+    return false;
+  }
+  if (chain_.GetByHash(parent_hex) != nullptr) {
+    return true;
+  }
+  if (inflight_blocks_.find(parent_hex) != inflight_blocks_.end()) {
+    return true;
+  }
+  return false;
 }
 
 void BlockSyncManager::RebuildDownloadQueueLocked() {
@@ -1515,6 +1564,25 @@ void BlockSyncManager::PruneStaleHeadersLocked() {
               << " remaining=" << header_index_.size()
               << " (was " << initial_size << ")\n";
 
+    // If we pruned headers, the previously tracked best header may no longer
+    // exist in the in-memory index. Recompute and rebuild the download queue so
+    // scheduling never wedges on missing parents.
+    if (const auto* tip = chain_.Tip()) {
+      best_header_height_ = tip->height;
+      best_header_hash_ = tip->hash;
+    } else {
+      best_header_height_ = 0;
+      best_header_hash_.fill(0);
+    }
+    for (const auto& kv : header_index_) {
+      const auto& entry = kv.second;
+      if (entry.height > best_header_height_) {
+        best_header_height_ = entry.height;
+        best_header_hash_ = entry.hash;
+      }
+    }
+    RebuildDownloadQueueLocked();
+
     // Check if we can clear backpressure
     const auto gap = best_header_height_ > chain_height ? (best_header_height_ - chain_height) : 0;
     if (gap <= kHeadersAheadLowWater && header_index_.size() <= kDownloadQueueLowWater) {
@@ -1542,6 +1610,22 @@ void BlockSyncManager::RemoveHeadersForPeerLocked(std::uint64_t peer_id) {
     std::cerr << "[sync] removed " << to_remove.size() << " headers from disconnected peer "
               << peer_id << "\n";
     headers_pruned_total_.fetch_add(to_remove.size());
+
+    if (const auto* tip = chain_.Tip()) {
+      best_header_height_ = tip->height;
+      best_header_hash_ = tip->hash;
+    } else {
+      best_header_height_ = 0;
+      best_header_hash_.fill(0);
+    }
+    for (const auto& kv : header_index_) {
+      const auto& entry = kv.second;
+      if (entry.height > best_header_height_) {
+        best_header_height_ = entry.height;
+        best_header_hash_ = entry.hash;
+      }
+    }
+    RebuildDownloadQueueLocked();
   }
 }
 
@@ -1629,72 +1713,132 @@ bool BlockSyncManager::PrepareBlockRequestForPeerLocked(std::uint64_t peer_id,
     return false;
   }
 
-  auto parent_ready = [&](const primitives::Hash256& candidate) -> bool {
-    const auto candidate_hex = HashToHex(candidate);
-    const auto it_header = header_index_.find(candidate_hex);
-    if (it_header == header_index_.end()) {
-      // If we don't know the parent, treat the candidate as not ready so we
-      // don't amplify orphan rates with out-of-order requests.
-      return false;
+  auto height_for = [&](const primitives::Hash256& hash) -> std::size_t {
+    if (const auto height = ParentHeightLocked(hash); height.has_value()) {
+      return *height;
     }
-    const auto parent = it_header->second.previous;
-    const bool parent_all_zero =
-        std::all_of(parent.begin(), parent.end(), [](std::uint8_t b) { return b == 0; });
-    if (parent_all_zero) {
-      return true;
-    }
-    const auto parent_hex = HashToHex(parent);
-    if (parent_hex.empty()) {
-      return false;
-    }
-    // If the parent is already known to the chainstate (either on the active
-    // chain or on a side-chain), the candidate can be connected without
-    // triggering an orphan.
-    if (chain_.GetByHash(parent_hex) != nullptr) {
-      return true;
-    }
-    // If we already have the parent cached as an orphan, wait until it becomes
-    // connectable rather than requesting more descendants.
-    if (orphan_blocks_.find(parent) != orphan_blocks_.end()) {
-      return false;
-    }
-    // If the parent is still queued (but not yet requested), request it first.
-    if (download_queue_hashes_.find(parent) != download_queue_hashes_.end()) {
-      return false;
-    }
-    return false;
+    return std::numeric_limits<std::size_t>::max();
   };
 
-  // Pop the next block that is not already in-flight.
-  primitives::Hash256 candidate{};
-  bool found = false;
+  auto assign_block = [&](std::size_t queue_index, const primitives::Hash256& hash) -> bool {
+    const auto hex = HashToHex(hash);
+    if (hex.empty()) {
+      return false;
+    }
+    download_queue_.erase(download_queue_.begin() + static_cast<std::ptrdiff_t>(queue_index));
+    download_queue_hashes_.erase(hash);
+    const auto assigned = InFlightBlock{hash, peer_id, now};
+    inflight_blocks_.emplace(hex, assigned);
+    worker.inflight_blocks += 1;
+    *out_hash = hash;
+    return true;
+  };
+
+  // 1) Prefer the lowest-height requestable block (parent connected or in-flight).
+  std::optional<std::size_t> best_index;
+  std::size_t best_height = std::numeric_limits<std::size_t>::max();
   for (std::size_t i = 0; i < download_queue_.size(); ++i) {
     const auto hash = download_queue_[i];
     if (orphan_blocks_.find(hash) != orphan_blocks_.end()) {
       continue;
     }
     const auto hex = HashToHex(hash);
-    if (inflight_blocks_.find(hex) != inflight_blocks_.end()) {
+    if (!hex.empty() && inflight_blocks_.find(hex) != inflight_blocks_.end()) {
       continue;
     }
-    if (!parent_ready(hash)) {
+    if (!IsParentSatisfiedLocked(hash)) {
       continue;
     }
-    candidate = hash;
-    download_queue_.erase(download_queue_.begin() + static_cast<std::ptrdiff_t>(i));
-    download_queue_hashes_.erase(hash);
-    const auto assigned = InFlightBlock{candidate, peer_id,
-                                        std::chrono::steady_clock::now()};
-    inflight_blocks_.emplace(hex, assigned);
-    worker.inflight_blocks += 1;
-    found = true;
-    break;
+    const auto height = height_for(hash);
+    if (height < best_height) {
+      best_height = height;
+      best_index = i;
+    }
   }
-  if (!found) {
+  if (best_index.has_value()) {
+    return assign_block(*best_index, download_queue_[*best_index]);
+  }
+
+  // 2) Parent-first escalation: if no requestable blocks exist, walk up the
+  // ancestor chain of the frontier candidate and ensure a requestable parent is
+  // queued and requested. "Queued" does not count as satisfied; only connected
+  // or in-flight parents unblock children.
+  std::optional<std::size_t> frontier_index;
+  std::size_t frontier_height = std::numeric_limits<std::size_t>::max();
+  for (std::size_t i = 0; i < download_queue_.size(); ++i) {
+    const auto hash = download_queue_[i];
+    if (orphan_blocks_.find(hash) != orphan_blocks_.end()) {
+      continue;
+    }
+    const auto hex = HashToHex(hash);
+    if (!hex.empty() && inflight_blocks_.find(hex) != inflight_blocks_.end()) {
+      continue;
+    }
+    const auto height = height_for(hash);
+    if (height < frontier_height) {
+      frontier_height = height;
+      frontier_index = i;
+    }
+  }
+  if (!frontier_index.has_value()) {
+    scheduler_no_requestable_cycles_total_.fetch_add(1);
     return false;
   }
-  *out_hash = candidate;
-  return true;
+
+  primitives::Hash256 cursor = download_queue_[*frontier_index];
+  std::unordered_set<std::string> visited;
+  visited.reserve(32);
+  constexpr std::size_t kMaxParentWalk = 256;
+  for (std::size_t depth = 0; depth < kMaxParentWalk; ++depth) {
+    const auto cursor_hex = HashToHex(cursor);
+    if (!cursor_hex.empty() && !visited.insert(cursor_hex).second) {
+      break;
+    }
+    if (IsParentSatisfiedLocked(cursor)) {
+      break;
+    }
+    const auto it_header = header_index_.find(cursor_hex);
+    if (it_header == header_index_.end()) {
+      break;
+    }
+    const auto parent = it_header->second.previous;
+    const bool parent_all_zero =
+        std::all_of(parent.begin(), parent.end(), [](std::uint8_t b) { return b == 0; });
+    if (parent_all_zero) {
+      break;
+    }
+    const auto parent_hex = HashToHex(parent);
+    if (parent_hex.empty()) {
+      break;
+    }
+
+    parent_ready_blocked_total_.fetch_add(1);
+
+    // Ensure the parent is actually eligible to be requested, not just "queued".
+    if (chain_.GetByHash(parent_hex) == nullptr &&
+        inflight_blocks_.find(parent_hex) == inflight_blocks_.end() &&
+        orphan_blocks_.find(parent) == orphan_blocks_.end() &&
+        download_queue_hashes_.find(parent) == download_queue_hashes_.end()) {
+      download_queue_.push_front(parent);
+      download_queue_hashes_.insert(parent);
+    }
+    cursor = parent;
+  }
+
+  if (!IsParentSatisfiedLocked(cursor)) {
+    scheduler_no_requestable_cycles_total_.fetch_add(1);
+    return false;
+  }
+
+  // Find the selected cursor in the queue and assign it.
+  for (std::size_t i = 0; i < download_queue_.size(); ++i) {
+    if (download_queue_[i] == cursor) {
+      return assign_block(i, cursor);
+    }
+  }
+
+  scheduler_no_requestable_cycles_total_.fetch_add(1);
+  return false;
 }
 
 void BlockSyncManager::StallWatcher(std::stop_token stop) {
@@ -1817,12 +1961,54 @@ void BlockSyncManager::StallWatcher(std::stop_token stop) {
 
       if (gap > 0 && inflight_blocks_.empty() && !download_queue_.empty()) {
         const auto since_progress = now - last_block_progress_time_;
-        if (since_progress > std::chrono::seconds(30)) {
+        const auto since_recovery = now - last_stall_recovery_time_;
+        const bool allow_recovery =
+            last_stall_recovery_time_.time_since_epoch().count() == 0 ||
+            since_recovery > std::chrono::seconds(30);
+        if (allow_recovery && since_progress > std::chrono::seconds(30)) {
           block_stall_recoveries_total_.fetch_add(1);
-          last_block_progress_time_ = now;
+          last_stall_recovery_time_ = now;
           trigger_sync_recovery = true;
           stall_gap = gap;
           stall_queue = download_queue_.size();
+        }
+      }
+
+      // Stall-breaker: if headers are ahead but no blocks are requestable, the
+      // scheduler can wedge in a state where "queued" parents block descendants
+      // without any actual in-flight work. Rebuild the frontier plan so we
+      // always have a requestable block near the tip.
+      if (gap > 0 && !download_queue_.empty()) {
+        const auto since_progress = now - last_block_progress_time_;
+        if (since_progress > std::chrono::seconds(45)) {
+          std::size_t requestable = 0;
+          for (const auto& hash : download_queue_) {
+            if (orphan_blocks_.find(hash) != orphan_blocks_.end()) {
+              continue;
+            }
+            const auto hex = HashToHex(hash);
+            if (!hex.empty() && inflight_blocks_.find(hex) != inflight_blocks_.end()) {
+              continue;
+            }
+            if (IsParentSatisfiedLocked(hash)) {
+              ++requestable;
+              break;
+            }
+          }
+          if (requestable == 0) {
+            const auto since_breaker = now - last_stall_breaker_time_;
+            const bool allow_breaker =
+                last_stall_breaker_time_.time_since_epoch().count() == 0 ||
+                since_breaker > std::chrono::seconds(60);
+            if (allow_breaker) {
+              stall_breaker_activations_total_.fetch_add(1);
+              last_stall_breaker_time_ = now;
+              std::cerr << "[sync] stall-breaker: no requestable blocks (gap=" << gap
+                        << ", queue=" << download_queue_.size() << "), rebuilding plan\n";
+              RebuildDownloadQueueLocked();
+              trigger_sync_recovery = true;
+            }
+          }
         }
       }
     }

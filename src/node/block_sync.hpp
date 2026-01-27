@@ -41,10 +41,17 @@ class BlockSyncManager {
     // New gauges
     std::size_t headers_gap{0};  // best header height minus chain height
     std::size_t active_outbound_peers{0};
+    std::size_t frontier_height{0};
+    std::size_t inflight_blocks{0};
+    std::size_t requestable_blocks{0};
+    std::size_t orphan_pool_size{0};
     // New counters
     std::uint64_t block_stall_recoveries{0};
     std::uint64_t inflight_block_timeouts{0};
     std::uint64_t unsolicited_headers_ignored{0};
+    std::uint64_t parent_ready_blocked{0};
+    std::uint64_t scheduler_no_requestable_cycles{0};
+    std::uint64_t stall_breaker_activations{0};
   };
 
   struct PeerSyncStats {
@@ -154,6 +161,9 @@ class BlockSyncManager {
   void RequestFromAnyPeer();
   bool PrepareBlockRequestForPeerLocked(std::uint64_t peer_id,
                                         primitives::Hash256* out_hash);
+  // Returns true when the candidate's parent is either connected (in chain) or
+  // already in-flight. Callers must hold `mutex_`.
+  bool IsParentSatisfiedLocked(const primitives::Hash256& candidate) const;
   void StallWatcher(std::stop_token stop);
   std::vector<primitives::Hash256> BuildLocator() const;
   static crypto::Sha3_256Hash ToInventoryId(const primitives::Hash256& hash);
@@ -217,6 +227,8 @@ class BlockSyncManager {
   primitives::Hash256 best_header_hash_{};
   std::chrono::steady_clock::time_point last_block_progress_time_{};
   std::chrono::steady_clock::time_point last_sync_tick_{};
+  std::chrono::steady_clock::time_point last_stall_recovery_time_{};
+  std::chrono::steady_clock::time_point last_stall_breaker_time_{};
   struct HeaderEntry {
     primitives::Hash256 hash{};
     primitives::Hash256 previous{};
@@ -235,6 +247,9 @@ class BlockSyncManager {
   std::atomic<std::uint64_t> block_stall_recoveries_total_{0};
   std::atomic<std::uint64_t> inflight_block_timeouts_total_{0};
   std::atomic<std::uint64_t> unsolicited_headers_ignored_total_{0};
+  std::atomic<std::uint64_t> parent_ready_blocked_total_{0};
+  std::atomic<std::uint64_t> scheduler_no_requestable_cycles_total_{0};
+  std::atomic<std::uint64_t> stall_breaker_activations_total_{0};
   // Header sync instrumentation counters
   std::atomic<std::uint64_t> headers_pruned_total_{0};
   std::atomic<std::uint64_t> headers_dropped_duplicate_{0};
