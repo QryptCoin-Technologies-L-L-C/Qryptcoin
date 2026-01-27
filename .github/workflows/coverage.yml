@@ -16,7 +16,7 @@ jobs:
 
       - name: Install gcovr
         run: |
-          python -m pip install --require-hashes -r .github/requirements-coverage.txt
+          python -m pip install -r .github/requirements-coverage.txt
 
       - name: Configure
         run: |
