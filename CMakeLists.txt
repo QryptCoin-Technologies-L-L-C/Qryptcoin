@@ -141,6 +141,7 @@ set(QRY_CORE_SOURCES
 
   src/node/storage/block_store.cpp
   src/node/storage/revealed_pubkeys_snapshot.cpp
+  src/node/storage/tx_fee_snapshot.cpp
   src/node/storage/utxo_snapshot.cpp
 
   src/net/addr_manager.cpp

@@ -140,9 +140,11 @@ class HDWallet {
   }
   crypto::SignatureAlgorithm DefaultAlgorithm() const noexcept { return default_algorithm_; }
   std::vector<WalletTransaction> ListTransactions() const;
-  bool AddUTXO(const WalletUTXO& utxo, bool is_coinbase = false);
+  bool AddUTXO(const WalletUTXO& utxo, bool is_coinbase = false,
+               primitives::Amount tx_fee_miks = 0);
   bool MaybeTrackOutput(const primitives::Hash256& txid, std::size_t vout_index,
-                        const primitives::CTxOut& txout, bool is_coinbase);
+                        const primitives::CTxOut& txout, bool is_coinbase,
+                        primitives::Amount tx_fee_miks = 0);
   std::optional<CreatedTransaction> CreateTransaction(
       const std::vector<std::pair<std::string, primitives::Amount>>& outputs,
       primitives::Amount fee_rate, std::string* error);

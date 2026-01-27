@@ -51,7 +51,8 @@ bool ValidateAndApplyBlock(const primitives::CBlock& block, std::uint32_t height
                            std::uint32_t witness_commitment_activation_height,
                            UTXOSet* view,
                            RevealedPubkeySet* revealed_pubkeys,
-                           std::string* error) {
+                           std::string* error,
+                           std::vector<primitives::Amount>* tx_fees_out) {
   if (!view || !revealed_pubkeys) {
     if (error) *error = "invalid validation state";
     return false;
@@ -63,6 +64,10 @@ bool ValidateAndApplyBlock(const primitives::CBlock& block, std::uint32_t height
   if (!block.transactions.front().IsCoinbase()) {
     if (error) *error = "missing coinbase";
     return false;
+  }
+
+  if (tx_fees_out) {
+    tx_fees_out->assign(block.transactions.size(), 0);
   }
 
   // Header-level checks: Merkle root and proof-of-work.
@@ -229,6 +234,9 @@ bool ValidateAndApplyBlock(const primitives::CBlock& block, std::uint32_t height
     if (!primitives::CheckedSub(input_sum, output_sum, &fee_delta)) {
       if (error) *error = "fee computation overflow";
       return false;
+    }
+    if (tx_fees_out) {
+      (*tx_fees_out)[tx_index] = fee_delta;
     }
     primitives::Amount next_fees = 0;
     if (!primitives::CheckedAdd(fees, fee_delta, &next_fees)) {

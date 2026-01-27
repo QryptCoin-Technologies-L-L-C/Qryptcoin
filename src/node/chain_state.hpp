@@ -17,6 +17,7 @@
 #include "consensus/utxo.hpp"
 #include "primitives/block.hpp"
 #include "primitives/transaction.hpp"
+#include "storage/tx_fee_snapshot.hpp"
 
 namespace qryptcoin::node {
 
@@ -39,6 +40,8 @@ struct ChainTelemetry {
   bool utxo_snapshot_dirty{false};
   std::uint64_t revealed_pubkeys_snapshot_failures{0};
   bool revealed_pubkeys_snapshot_dirty{false};
+  std::uint64_t tx_fee_snapshot_failures{0};
+  bool tx_fee_snapshot_dirty{false};
 };
 
 struct ChainTipInfo {
@@ -72,6 +75,7 @@ class ChainState {
   bool GetCoinMetadata(const primitives::COutPoint& outpoint,
                        std::uint32_t* height,
                        bool* coinbase) const;
+  bool GetTxFee(const primitives::Hash256& txid, primitives::Amount* fee) const;
   bool ConnectBlock(const primitives::CBlock& block, std::string* error);
   bool ReadBlock(const BlockRecord& record, primitives::CBlock* block, std::string* error) const;
   ChainTelemetry GetTelemetry() const;
@@ -85,6 +89,8 @@ class ChainState {
   bool LoadBlocksLocked(std::string* error);
   bool InitializeGenesisLocked(std::string* error);
   bool EnsureUtxoSnapshotLocked(std::string* error);
+  bool EnsureTxFeeSnapshotLocked(std::string* error);
+  bool RebuildTxFeesLocked(BlockRecord* tip, std::string* error);
   bool RebuildActiveChainLocked(BlockRecord* tip, std::string* error);
   bool ApplyBlockToActiveChainLocked(BlockRecord* record, std::string* error);
   BlockRecord* AddBlockRecordLocked(const primitives::CBlockHeader& header,
@@ -124,6 +130,10 @@ class ChainState {
   consensus::UTXOSet utxo_;
   consensus::RevealedPubkeySet revealed_pubkeys_;
   std::string revealed_pubkeys_path_;
+  storage::TxFeeMap tx_fees_;
+  std::string tx_fees_path_;
+  std::uint64_t tx_fee_snapshot_failures_{0};
+  bool tx_fee_snapshot_dirty_{false};
   static constexpr std::size_t kMaxCachedBlocks = 1024;
   std::unordered_map<std::string, primitives::CBlock> block_cache_;
   std::deque<std::string> block_cache_fifo_;

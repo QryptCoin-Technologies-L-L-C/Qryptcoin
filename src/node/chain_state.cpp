@@ -21,9 +21,11 @@
 #include "consensus/tx_validator.hpp"
 #include "storage/block_store.hpp"
 #include "storage/revealed_pubkeys_snapshot.hpp"
+#include "storage/tx_fee_snapshot.hpp"
 #include "storage/utxo_snapshot.hpp"
 #include "util/atomic_file.hpp"
 #include "util/hex.hpp"
+#include "primitives/txid.hpp"
 
 namespace qryptcoin::node {
 
@@ -98,6 +100,7 @@ bool WriteSnapshotTipMeta(const std::string& snapshot_path,
 ChainState::ChainState(std::string block_path, std::string utxo_path)
     : block_path_(std::move(block_path)), utxo_path_(std::move(utxo_path)) {
   revealed_pubkeys_path_ = utxo_path_ + ".pubkeys";
+  tx_fees_path_ = utxo_path_ + ".txfees";
   snapshot_saver_ = &storage::SaveUTXOSnapshot;
 }
 
@@ -120,7 +123,10 @@ bool ChainState::Initialize(std::string* error) {
     if (error) *error = "no best tip available";
     return false;
   }
-  return EnsureUtxoSnapshotLocked(error);
+  if (!EnsureUtxoSnapshotLocked(error)) {
+    return false;
+  }
+  return EnsureTxFeeSnapshotLocked(error);
 }
 
 std::size_t ChainState::BlockCount() const {
@@ -224,6 +230,18 @@ bool ChainState::GetCoinMetadata(const primitives::COutPoint& outpoint,
   return true;
 }
 
+bool ChainState::GetTxFee(const primitives::Hash256& txid, primitives::Amount* fee) const {
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  const auto it = tx_fees_.find(txid);
+  if (it == tx_fees_.end()) {
+    return false;
+  }
+  if (fee) {
+    *fee = it->second;
+  }
+  return true;
+}
+
 bool ChainState::ConnectBlock(const primitives::CBlock& block, std::string* error) {
   std::unique_lock<std::shared_mutex> lock(mutex_);
   BlockRecord* record = AddBlockRecordLocked(block.header, std::nullopt, error, false);
@@ -289,10 +307,12 @@ bool ChainState::ConnectBlock(const primitives::CBlock& block, std::string* erro
 
     consensus::UTXOSet working = utxo_;
     consensus::RevealedPubkeySet working_pubkeys = revealed_pubkeys_;
+    std::vector<primitives::Amount> block_tx_fees;
     if (!consensus::ValidateAndApplyBlock(block, static_cast<std::uint32_t>(record->height),
                                           lock_time_cutoff_time, params.max_block_serialized_bytes,
                                           params.witness_commitment_activation_height,
-                                          &working, &working_pubkeys, &validation_error)) {
+                                          &working, &working_pubkeys, &validation_error,
+                                          &block_tx_fees)) {
       block_index_.erase(record->hash_hex);
       RecalculateBestTipLocked();
       if (error) *error = "validation failed: " + validation_error;
@@ -317,6 +337,12 @@ bool ChainState::ConnectBlock(const primitives::CBlock& block, std::string* erro
 
     utxo_ = std::move(working);
     revealed_pubkeys_ = std::move(working_pubkeys);
+    if (block_tx_fees.size() == block.transactions.size()) {
+      for (std::size_t tx_index = 0; tx_index < block.transactions.size(); ++tx_index) {
+        const auto txid = primitives::ComputeTxId(block.transactions[tx_index]);
+        tx_fees_[txid] = block_tx_fees[tx_index];
+      }
+    }
     active_chain_.push_back(record);
     record->in_active_chain = true;
     best_tip_ = record;
@@ -328,6 +354,7 @@ bool ChainState::ConnectBlock(const primitives::CBlock& block, std::string* erro
     BuildActiveChainLocked(record, &new_chain);
     consensus::UTXOSet rebuilt;
     consensus::RevealedPubkeySet rebuilt_pubkeys;
+    storage::TxFeeMap rebuilt_tx_fees;
     for (std::size_t idx = 0; idx < new_chain.size(); ++idx) {
       std::string block_error;
       primitives::CBlock candidate_block;
@@ -339,17 +366,25 @@ bool ChainState::ConnectBlock(const primitives::CBlock& block, std::string* erro
         return false;
       }
       std::uint64_t lock_time_cutoff_time = 0;
+      std::vector<primitives::Amount> block_tx_fees;
       if (!CheckTimeForIndexLocked(new_chain, idx, &lock_time_cutoff_time, &block_error) ||
           !CheckDifficultyForIndexLocked(new_chain, idx, &block_error) ||
           !consensus::ValidateAndApplyBlock(candidate_block, static_cast<std::uint32_t>(idx),
                                             lock_time_cutoff_time,
                                             params.max_block_serialized_bytes,
                                             params.witness_commitment_activation_height,
-                                            &rebuilt, &rebuilt_pubkeys, &block_error)) {
+                                            &rebuilt, &rebuilt_pubkeys, &block_error,
+                                            &block_tx_fees)) {
         block_index_.erase(record->hash_hex);
         RecalculateBestTipLocked();
         if (error) *error = "validation failed: " + block_error;
         return false;
+      }
+      if (block_tx_fees.size() == candidate_block.transactions.size()) {
+        for (std::size_t tx_index = 0; tx_index < candidate_block.transactions.size(); ++tx_index) {
+          const auto txid = primitives::ComputeTxId(candidate_block.transactions[tx_index]);
+          rebuilt_tx_fees[txid] = block_tx_fees[tx_index];
+        }
       }
     }
 
@@ -420,6 +455,7 @@ bool ChainState::ConnectBlock(const primitives::CBlock& block, std::string* erro
     }
     utxo_ = std::move(rebuilt);
     revealed_pubkeys_ = std::move(rebuilt_pubkeys);
+    tx_fees_ = std::move(rebuilt_tx_fees);
     best_tip_ = record;
     best_chain_work_ = record->chain_work;
     chain_changed = true;
@@ -432,6 +468,7 @@ bool ChainState::ConnectBlock(const primitives::CBlock& block, std::string* erro
     bool utxo_snapshot_ok = snapshot_saver_ && snapshot_saver_(utxo_, utxo_path_);
     bool pubkeys_snapshot_ok =
         storage::SaveRevealedPubkeysSnapshot(revealed_pubkeys_, revealed_pubkeys_path_);
+    bool fee_snapshot_ok = storage::SaveTxFeeSnapshot(tx_fees_, tx_fees_path_);
 
     if (!utxo_snapshot_ok) {
       ++utxo_snapshot_failures_;
@@ -443,12 +480,18 @@ bool ChainState::ConnectBlock(const primitives::CBlock& block, std::string* erro
       revealed_pubkeys_snapshot_dirty_ = true;
       std::cerr << "[chain] warn: failed to update revealed-pubkeys snapshot; node will continue (restart may require reindex)\n";
     }
-    if (!utxo_snapshot_ok || !pubkeys_snapshot_ok) {
+    if (!fee_snapshot_ok) {
+      ++tx_fee_snapshot_failures_;
+      tx_fee_snapshot_dirty_ = true;
+      std::cerr << "[chain] warn: failed to update tx-fee snapshot; node will continue (restart may require reindex)\n";
+    }
+    if (!utxo_snapshot_ok || !pubkeys_snapshot_ok || !fee_snapshot_ok) {
       utxo_snapshot_dirty_ = true;
       revealed_pubkeys_snapshot_dirty_ = true;
+      tx_fee_snapshot_dirty_ = true;
     }
 
-    if (utxo_snapshot_ok && pubkeys_snapshot_ok) {
+    if (utxo_snapshot_ok && pubkeys_snapshot_ok && fee_snapshot_ok) {
       bool pubkeys_meta_ok = false;
       std::string pubkeys_meta_error;
       if (!WriteSnapshotTipMeta(revealed_pubkeys_path_,
@@ -474,12 +517,26 @@ bool ChainState::ConnectBlock(const primitives::CBlock& block, std::string* erro
         utxo_meta_ok = true;
       }
 
-      if (utxo_meta_ok && pubkeys_meta_ok) {
+      bool fee_meta_ok = false;
+      std::string fee_meta_error;
+      if (!WriteSnapshotTipMeta(tx_fees_path_, static_cast<std::uint32_t>(best_tip_->height),
+                                best_tip_->hash_hex, &fee_meta_error)) {
+        ++tx_fee_snapshot_failures_;
+        tx_fee_snapshot_dirty_ = true;
+        std::cerr << "[chain] warn: failed to write tx-fee snapshot metadata: " << fee_meta_error
+                  << "\n";
+      } else {
+        fee_meta_ok = true;
+      }
+
+      if (utxo_meta_ok && pubkeys_meta_ok && fee_meta_ok) {
         utxo_snapshot_dirty_ = false;
         revealed_pubkeys_snapshot_dirty_ = false;
+        tx_fee_snapshot_dirty_ = false;
       } else {
         utxo_snapshot_dirty_ = true;
         revealed_pubkeys_snapshot_dirty_ = true;
+        tx_fee_snapshot_dirty_ = true;
       }
     }
   }
@@ -503,6 +560,8 @@ ChainTelemetry ChainState::GetTelemetry() const {
   stats.utxo_snapshot_dirty = utxo_snapshot_dirty_;
   stats.revealed_pubkeys_snapshot_failures = revealed_pubkeys_snapshot_failures_;
   stats.revealed_pubkeys_snapshot_dirty = revealed_pubkeys_snapshot_dirty_;
+  stats.tx_fee_snapshot_failures = tx_fee_snapshot_failures_;
+  stats.tx_fee_snapshot_dirty = tx_fee_snapshot_dirty_;
   return stats;
 }
 
@@ -695,12 +754,21 @@ bool ChainState::EnsureUtxoSnapshotLocked(std::string* error) {
     revealed_pubkeys_snapshot_dirty_ = true;
     std::cerr << "[chain] warn: failed to persist revealed-pubkeys snapshot after rebuild; node will continue\n";
   }
-  if (!utxo_snapshot_ok || !pubkeys_snapshot_ok) {
-    utxo_snapshot_dirty_ = true;
-    revealed_pubkeys_snapshot_dirty_ = true;
+
+  bool fee_snapshot_ok = storage::SaveTxFeeSnapshot(tx_fees_, tx_fees_path_);
+  if (!fee_snapshot_ok) {
+    ++tx_fee_snapshot_failures_;
+    tx_fee_snapshot_dirty_ = true;
+    std::cerr << "[chain] warn: failed to persist tx-fee snapshot after rebuild; node will continue\n";
   }
 
-  if (utxo_snapshot_ok && pubkeys_snapshot_ok) {
+  if (!utxo_snapshot_ok || !pubkeys_snapshot_ok || !fee_snapshot_ok) {
+    utxo_snapshot_dirty_ = true;
+    revealed_pubkeys_snapshot_dirty_ = true;
+    tx_fee_snapshot_dirty_ = true;
+  }
+
+  if (utxo_snapshot_ok && pubkeys_snapshot_ok && fee_snapshot_ok) {
     bool pubkeys_meta_ok = false;
     std::string pubkeys_meta_error;
     if (!WriteSnapshotTipMeta(revealed_pubkeys_path_,
@@ -726,14 +794,138 @@ bool ChainState::EnsureUtxoSnapshotLocked(std::string* error) {
       utxo_meta_ok = true;
     }
 
-    if (utxo_meta_ok && pubkeys_meta_ok) {
+    bool fee_meta_ok = false;
+    std::string fee_meta_error;
+    if (!WriteSnapshotTipMeta(tx_fees_path_, static_cast<std::uint32_t>(best_tip_->height),
+                              best_tip_->hash_hex, &fee_meta_error)) {
+      ++tx_fee_snapshot_failures_;
+      tx_fee_snapshot_dirty_ = true;
+      std::cerr << "[chain] warn: failed to write tx-fee snapshot metadata: " << fee_meta_error
+                << "\n";
+    } else {
+      fee_meta_ok = true;
+    }
+
+    if (utxo_meta_ok && pubkeys_meta_ok && fee_meta_ok) {
       utxo_snapshot_dirty_ = false;
       revealed_pubkeys_snapshot_dirty_ = false;
+      tx_fee_snapshot_dirty_ = false;
     } else {
       utxo_snapshot_dirty_ = true;
       revealed_pubkeys_snapshot_dirty_ = true;
+      tx_fee_snapshot_dirty_ = true;
     }
   }
+  return true;
+}
+
+bool ChainState::EnsureTxFeeSnapshotLocked(std::string* error) {
+  if (!best_tip_) {
+    if (error) *error = "missing best tip";
+    return false;
+  }
+
+  std::uint32_t snapshot_height = 0;
+  std::string snapshot_hash;
+  const bool loaded = storage::LoadTxFeeSnapshot(&tx_fees_, tx_fees_path_);
+  const bool meta_loaded =
+      loaded && ReadSnapshotTipMeta(tx_fees_path_, &snapshot_height, &snapshot_hash);
+
+  if (meta_loaded && snapshot_height == best_tip_->height &&
+      snapshot_hash == best_tip_->hash_hex) {
+    tx_fee_snapshot_dirty_ = false;
+    return true;
+  }
+
+  std::string rebuild_error;
+  if (!RebuildTxFeesLocked(best_tip_, &rebuild_error)) {
+    ++tx_fee_snapshot_failures_;
+    tx_fee_snapshot_dirty_ = true;
+    std::cerr << "[chain] warn: failed to rebuild tx-fee snapshot: "
+              << (rebuild_error.empty() ? "unknown error" : rebuild_error)
+              << " (fees will be unavailable)\n";
+    tx_fees_.clear();
+    return true;
+  }
+
+  bool fee_snapshot_ok = storage::SaveTxFeeSnapshot(tx_fees_, tx_fees_path_);
+  if (!fee_snapshot_ok) {
+    ++tx_fee_snapshot_failures_;
+    tx_fee_snapshot_dirty_ = true;
+    std::cerr << "[chain] warn: failed to persist tx-fee snapshot; node will continue\n";
+  }
+
+  if (fee_snapshot_ok) {
+    std::string meta_error;
+    if (!WriteSnapshotTipMeta(tx_fees_path_, static_cast<std::uint32_t>(best_tip_->height),
+                              best_tip_->hash_hex, &meta_error)) {
+      ++tx_fee_snapshot_failures_;
+      tx_fee_snapshot_dirty_ = true;
+      std::cerr << "[chain] warn: failed to write tx-fee snapshot metadata: " << meta_error
+                << "\n";
+    } else {
+      tx_fee_snapshot_dirty_ = false;
+    }
+  }
+
+  return true;
+}
+
+bool ChainState::RebuildTxFeesLocked(BlockRecord* tip, std::string* error) {
+  if (!tip) {
+    if (error) *error = "no chain tip available";
+    return false;
+  }
+  const auto& params = consensus::Params(config::GetNetworkConfig().type);
+  std::vector<BlockRecord*> chain;
+  BuildActiveChainLocked(tip, &chain);
+
+  consensus::UTXOSet rebuilt;
+  consensus::RevealedPubkeySet rebuilt_pubkeys;
+  storage::TxFeeMap rebuilt_tx_fees;
+
+  for (std::size_t idx = 0; idx < chain.size(); ++idx) {
+    std::string block_error;
+    std::uint64_t lock_time_cutoff_time = 0;
+    if (!CheckTimeForIndexLocked(chain, idx, &lock_time_cutoff_time, &block_error) ||
+        !CheckDifficultyForIndexLocked(chain, idx, &block_error)) {
+      if (error) {
+        std::ostringstream oss;
+        oss << "block " << idx << " invalid: " << block_error;
+        *error = oss.str();
+      }
+      return false;
+    }
+    primitives::CBlock connect_block;
+    if (!LoadBlockDataLocked(chain[idx], nullptr, &connect_block, &block_error)) {
+      if (error) {
+        std::ostringstream oss;
+        oss << "block " << idx << " invalid: " << block_error;
+        *error = oss.str();
+      }
+      return false;
+    }
+    std::vector<primitives::Amount> tx_fees;
+    if (!consensus::ValidateAndApplyBlock(connect_block, static_cast<std::uint32_t>(idx),
+                                          lock_time_cutoff_time, params.max_block_serialized_bytes,
+                                          params.witness_commitment_activation_height,
+                                          &rebuilt, &rebuilt_pubkeys, &block_error, &tx_fees)) {
+      if (error) {
+        std::ostringstream oss;
+        oss << "block " << idx << " invalid: " << block_error;
+        *error = oss.str();
+      }
+      return false;
+    }
+    if (tx_fees.size() == connect_block.transactions.size()) {
+      for (std::size_t tx_index = 0; tx_index < connect_block.transactions.size(); ++tx_index) {
+        const auto txid = primitives::ComputeTxId(connect_block.transactions[tx_index]);
+        rebuilt_tx_fees[txid] = tx_fees[tx_index];
+      }
+    }
+  }
+
+  tx_fees_ = std::move(rebuilt_tx_fees);
   return true;
 }
 
@@ -747,6 +939,7 @@ bool ChainState::RebuildActiveChainLocked(BlockRecord* tip, std::string* error) 
   BuildActiveChainLocked(tip, &chain);
   consensus::UTXOSet rebuilt;
   consensus::RevealedPubkeySet rebuilt_pubkeys;
+  storage::TxFeeMap rebuilt_tx_fees;
   for (std::size_t idx = 0; idx < chain.size(); ++idx) {
     std::string block_error;
     std::uint64_t lock_time_cutoff_time = 0;
@@ -775,16 +968,23 @@ bool ChainState::RebuildActiveChainLocked(BlockRecord* tip, std::string* error) 
       }
       return false;
     }
+    std::vector<primitives::Amount> tx_fees;
     if (!consensus::ValidateAndApplyBlock(connect_block, static_cast<std::uint32_t>(idx),
                                           lock_time_cutoff_time, params.max_block_serialized_bytes,
                                           params.witness_commitment_activation_height,
-                                          &rebuilt, &rebuilt_pubkeys, &block_error)) {
+                                          &rebuilt, &rebuilt_pubkeys, &block_error, &tx_fees)) {
       if (error) {
         std::ostringstream oss;
         oss << "block " << idx << " invalid: " << block_error;
         *error = oss.str();
       }
       return false;
+    }
+    if (tx_fees.size() == connect_block.transactions.size()) {
+      for (std::size_t tx_index = 0; tx_index < connect_block.transactions.size(); ++tx_index) {
+        const auto txid = primitives::ComputeTxId(connect_block.transactions[tx_index]);
+        rebuilt_tx_fees[txid] = tx_fees[tx_index];
+      }
     }
   }
   ResetActiveFlagsLocked();
@@ -794,6 +994,7 @@ bool ChainState::RebuildActiveChainLocked(BlockRecord* tip, std::string* error) 
   }
   utxo_ = std::move(rebuilt);
   revealed_pubkeys_ = std::move(rebuilt_pubkeys);
+  tx_fees_ = std::move(rebuilt_tx_fees);
   best_tip_ = tip;
   best_chain_work_ = tip->chain_work;
   return true;
@@ -816,15 +1017,22 @@ bool ChainState::ApplyBlockToActiveChainLocked(BlockRecord* record, std::string*
   }
   consensus::UTXOSet working = utxo_;
   consensus::RevealedPubkeySet working_pubkeys = revealed_pubkeys_;
+  std::vector<primitives::Amount> tx_fees;
   if (!consensus::ValidateAndApplyBlock(connect_block, static_cast<std::uint32_t>(record->height),
                                         lock_time_cutoff_time, params.max_block_serialized_bytes,
                                         params.witness_commitment_activation_height,
-                                        &working, &working_pubkeys, &validation_error)) {
+                                        &working, &working_pubkeys, &validation_error, &tx_fees)) {
     if (error) *error = "validation failed: " + validation_error;
     return false;
   }
   utxo_ = std::move(working);
   revealed_pubkeys_ = std::move(working_pubkeys);
+  if (tx_fees.size() == connect_block.transactions.size()) {
+    for (std::size_t tx_index = 0; tx_index < connect_block.transactions.size(); ++tx_index) {
+      const auto txid = primitives::ComputeTxId(connect_block.transactions[tx_index]);
+      tx_fees_[txid] = tx_fees[tx_index];
+    }
+  }
   active_chain_.push_back(record);
   record->in_active_chain = true;
   best_tip_ = record;

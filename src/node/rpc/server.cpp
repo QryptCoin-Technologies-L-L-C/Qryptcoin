@@ -276,7 +276,11 @@ std::optional<primitives::Amount> ParseAmount(const nlohmann::json& value) {
   return miks;
 }
 
-nlohmann::json TxToJson(const primitives::CTransaction& tx, const wallet::HDWallet* wallet) {
+std::uint64_t ComputeTransactionVBytes(const primitives::CTransaction& tx);
+
+nlohmann::json TxToJson(const primitives::CTransaction& tx, const wallet::HDWallet* wallet,
+                        std::optional<primitives::Amount> fee_miks = std::nullopt,
+                        std::optional<double> feerate_miks_per_vb = std::nullopt) {
   nlohmann::json tx_json;
   tx_json["txid"] = TxIdHex(tx);
   tx_json["version"] = tx.version;
@@ -319,6 +323,20 @@ nlohmann::json TxToJson(const primitives::CTransaction& tx, const wallet::HDWall
     vout.push_back(out_json);
   }
   tx_json["vout"] = vout;
+
+  if (fee_miks.has_value()) {
+    tx_json["fee_miks"] = *fee_miks;
+    tx_json["fee"] = FormatAmount(*fee_miks);
+
+    const std::uint64_t vbytes = ComputeTransactionVBytes(tx);
+    tx_json["vbytes"] = vbytes;
+    if (feerate_miks_per_vb.has_value()) {
+      tx_json["feerate_miks_per_vb"] = *feerate_miks_per_vb;
+    } else if (vbytes > 0) {
+      tx_json["feerate_miks_per_vb"] =
+          static_cast<double>(*fee_miks) / static_cast<double>(vbytes);
+    }
+  }
   return tx_json;
 }
 
@@ -489,7 +507,7 @@ RpcServer::RpcServer(std::unique_ptr<wallet::HDWallet> wallet, bool wallet_enabl
   }
 
   if (mempool_expiry_.count() > 0 || mempool_rebroadcast_interval_.count() > 0 ||
-      !mempool_persist_path_.empty()) {
+      !mempool_persist_path_.empty() || mempool_limit_bytes_ != 0) {
     mempool_maintenance_thread_ =
         std::jthread([this](std::stop_token stop) { MempoolMaintenanceLoop(stop); });
   }
@@ -1040,7 +1058,17 @@ nlohmann::json RpcServer::HandleGetBlock(const nlohmann::json& params) const {
   if (verbosity > 0) {
     nlohmann::json txs = nlohmann::json::array();
     for (const auto& tx : full_block.transactions) {
-      txs.push_back(TxToJson(tx, wallet_.get()));
+      std::optional<primitives::Amount> fee_miks = std::nullopt;
+      const auto txid = primitives::ComputeTxId(tx);
+      if (tx.IsCoinbase()) {
+        fee_miks = 0;
+      } else {
+        primitives::Amount fee = 0;
+        if (chain_.GetTxFee(txid, &fee)) {
+          fee_miks = fee;
+        }
+      }
+      txs.push_back(TxToJson(tx, wallet_.get(), fee_miks));
     }
     block["tx"] = txs;
   }
@@ -1515,7 +1543,7 @@ nlohmann::json RpcServer::HandleSendToAddress(const nlohmann::json& params) {
   nlohmann::json result;
   result["txid"] = TxIdHex(tx);
   result["hex"] = SerializeTransactionHex(tx);
-  result["metadata"] = TxToJson(tx, wallet_.get());
+  result["metadata"] = TxToJson(tx, wallet_.get(), created->fee);
   result["accepted_to_mempool"] = accepted;
   if (!accepted && !reject_reason.empty()) {
     result["rejection_reason"] = reject_reason;
@@ -2217,6 +2245,8 @@ nlohmann::json RpcServer::HandleGetRawTransaction(const nlohmann::json& params) 
   std::uint32_t block_height = 0;
   bool in_mempool = false;
   bool found = false;
+  std::optional<primitives::Amount> fee_miks = std::nullopt;
+  std::optional<double> feerate_miks_per_vb = std::nullopt;
 
   {
     std::lock_guard<std::mutex> lock(mempool_mutex_);
@@ -2225,6 +2255,8 @@ nlohmann::json RpcServer::HandleGetRawTransaction(const nlohmann::json& params) 
       found_tx = it->second.tx;
       in_mempool = true;
       found = true;
+      fee_miks = it->second.fee_miks;
+      feerate_miks_per_vb = it->second.feerate_miks_per_vb;
     }
   }
 
@@ -2269,7 +2301,14 @@ nlohmann::json RpcServer::HandleGetRawTransaction(const nlohmann::json& params) 
     return SerializeTransactionHex(found_tx);
   }
 
-  nlohmann::json result = TxToJson(found_tx, wallet_.get());
+  if (!in_mempool) {
+    primitives::Amount fee = 0;
+    if (chain_.GetTxFee(target, &fee)) {
+      fee_miks = fee;
+    }
+  }
+
+  nlohmann::json result = TxToJson(found_tx, wallet_.get(), fee_miks, feerate_miks_per_vb);
   result["hex"] = SerializeTransactionHex(found_tx);
   result["blockhash"] = block_hash;
   result["in_mempool"] = in_mempool;
@@ -3181,8 +3220,12 @@ void RpcServer::IndexWalletOutputs(const primitives::CBlock& block, bool save_wa
   for (const auto& tx : block.transactions) {
     const bool is_coinbase = tx.IsCoinbase();
     auto txid = primitives::ComputeTxId(tx);
+    primitives::Amount fee_miks = 0;
+    if (!is_coinbase) {
+      (void)chain_.GetTxFee(txid, &fee_miks);
+    }
     for (std::size_t i = 0; i < tx.vout.size(); ++i) {
-      if (wallet.MaybeTrackOutput(txid, i, tx.vout[i], is_coinbase)) {
+      if (wallet.MaybeTrackOutput(txid, i, tx.vout[i], is_coinbase, fee_miks)) {
         changed = true;
       }
     }
@@ -4101,6 +4144,7 @@ void RpcServer::MempoolMaintenanceLoop(std::stop_token stop) {
   auto next_expiry_check = clock::now() + expiry_check_interval;
   auto next_rebroadcast = clock::now() + mempool_rebroadcast_interval_;
   auto next_persist = clock::now() + mempool_persist_interval_;
+  auto next_fee_floor_decay = clock::now() + std::chrono::seconds(60);
 
   while (!stop.stop_requested()) {
     const auto now = clock::now();
@@ -4127,6 +4171,14 @@ void RpcServer::MempoolMaintenanceLoop(std::stop_token stop) {
         }
       }
       next_persist = now + mempool_persist_interval_;
+    }
+
+    if (now >= next_fee_floor_decay) {
+      {
+        std::lock_guard<std::mutex> lock(mempool_mutex_);
+        MaybeDecayMempoolMinFeeLocked();
+      }
+      next_fee_floor_decay = now + std::chrono::seconds(60);
     }
 
     std::this_thread::sleep_for(std::chrono::seconds(1));
