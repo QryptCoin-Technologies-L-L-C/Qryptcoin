@@ -1,0 +1,54 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  wait-for-ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for CI
+        uses: lewagon/wait-on-check-action@v1.3.4
+        with:
+          ref: ${{ github.sha }}
+          check-name: 'Build and Test (ubuntu-latest)'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          wait-interval: 30
+
+  deploy:
+    needs: wait-for-ci
+    runs-on: ubuntu-latest
+    environment: production
+    strategy:
+      fail-fast: false
+      matrix:
+        server: [1, 2, 3]
+    steps:
+      - name: Deploy to server ${{ matrix.server }}
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          SUDO_PASS: ${{ secrets[format('SERVER_{0}_SUDO_PASS', matrix.server)] }}
+        with:
+          host: ${{ secrets[format('SERVER_{0}_HOST', matrix.server)] }}
+          username: ${{ secrets[format('SERVER_{0}_USER', matrix.server)] }}
+          key: ${{ secrets[format('SERVER_{0}_SSH_KEY', matrix.server)] }}
+          envs: SUDO_PASS
+          script_stop: true
+          command_timeout: 30m
+          script: ${{ secrets[format('SERVER_{0}_DEPLOY_SCRIPT', matrix.server)] }}
+
+  notify:
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Deployment summary
+        run: |
+          echo "## Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "Commit: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
