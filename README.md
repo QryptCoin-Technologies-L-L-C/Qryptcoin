@@ -1,5 +1,7 @@
 # QryptCoin Core
 
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/11837/badge)](https://www.bestpractices.dev/projects/11837)
+
 QryptCoin Core is the reference implementation of the QryptCoin protocol, maintained by **QryptCoin Technologies LLC**.
 
 QryptCoin is a peer-to-peer electronic cash system that enables direct value transfer without reliance on centralized intermediaries. The system uses a proof-of-work blockchain to establish a globally ordered ledger of transactions, with ownership represented by unspent transaction outputs (UTXOs).
