@@ -1,5 +1,6 @@
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <vector>
 
 #include "tx/primitives/serialize.hpp"
@@ -25,14 +26,20 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data,
   const bool allow_legacy_encoding = (mode & 0x04u) != 0;
   const bool expect_witness = (mode & 0x08u) == 0;
 
-  std::size_t offset = 1;
-  if (parse_block) {
-    CBlock block;
-    (void)DeserializeBlock(buffer, &offset, &block, legacy_varint);
-  } else {
-    CTransaction tx;
-    (void)DeserializeTransaction(buffer, &offset, &tx, expect_witness,
-                                 allow_legacy_encoding, legacy_varint);
+  // Catch allocation failures and parse errors - these are expected when
+  // fuzzing malformed input and should not crash the harness.
+  try {
+    std::size_t offset = 1;
+    if (parse_block) {
+      CBlock block;
+      (void)DeserializeBlock(buffer, &offset, &block, legacy_varint);
+    } else {
+      CTransaction tx;
+      (void)DeserializeTransaction(buffer, &offset, &tx, expect_witness,
+                                   allow_legacy_encoding, legacy_varint);
+    }
+  } catch (const std::exception&) {
+    // Expected for malformed input (std::length_error, std::bad_alloc, etc.)
   }
 
   return 0;
