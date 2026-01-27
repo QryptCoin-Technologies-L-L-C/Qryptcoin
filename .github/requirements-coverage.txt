@@ -1,0 +1,2 @@
+# Requirements for coverage workflow - pinned with hashes for supply chain security
+gcovr==8.6 --hash=sha256:dbf9d87c38042752ad6f530aa8210427e22b526611bb7b7bfed0e81977d1f1ef
