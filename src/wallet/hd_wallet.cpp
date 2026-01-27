@@ -950,7 +950,8 @@ std::vector<WalletTransaction> HDWallet::ListTransactions() const {
   return transactions_;
 }
 
-bool HDWallet::AddUTXO(const WalletUTXO& utxo, bool is_coinbase) {
+bool HDWallet::AddUTXO(const WalletUTXO& utxo, bool is_coinbase,
+                       primitives::Amount tx_fee_miks) {
   if (!primitives::MoneyRange(utxo.txout.value)) {
     return false;
   }
@@ -977,7 +978,7 @@ bool HDWallet::AddUTXO(const WalletUTXO& utxo, bool is_coinbase) {
   event.incoming = true;
   event.timestamp = Now();
   event.label = is_coinbase ? "Mined" : "Incoming";
-  event.fee = 0;
+  event.fee = tx_fee_miks;
   event.confirmations = 0;
   event.coinbase = is_coinbase;
   RecordTransaction(event);
@@ -985,7 +986,8 @@ bool HDWallet::AddUTXO(const WalletUTXO& utxo, bool is_coinbase) {
 }
 
 bool HDWallet::MaybeTrackOutput(const primitives::Hash256& txid, std::size_t vout_index,
-                                const primitives::CTxOut& txout, bool is_coinbase) {
+                                const primitives::CTxOut& txout, bool is_coinbase,
+                                primitives::Amount tx_fee_miks) {
   script::ScriptPubKey script{txout.locking_descriptor};
   std::array<std::uint8_t, script::kP2QHWitnessProgramSize> program{};
   if (!script::ExtractWitnessProgram(script, &program)) {
@@ -1006,7 +1008,7 @@ bool HDWallet::MaybeTrackOutput(const primitives::Hash256& txid, std::size_t vou
     utxo.key_index = entry.index;
     utxo.algorithm = entry.algorithm;
     utxo.watch_only = false;
-    return AddUTXO(utxo, is_coinbase);
+    return AddUTXO(utxo, is_coinbase, tx_fee_miks);
   }
   auto it_watch = watch_only_program_index_.find(program_hash);
   if (it_watch == watch_only_program_index_.end()) {
@@ -1020,7 +1022,7 @@ bool HDWallet::MaybeTrackOutput(const primitives::Hash256& txid, std::size_t vou
   utxo.key_index = 0;
   utxo.algorithm = watch_entry.descriptor.algorithm;
   utxo.watch_only = true;
-  return AddUTXO(utxo, is_coinbase);
+  return AddUTXO(utxo, is_coinbase, tx_fee_miks);
 }
 
 HDWallet::KeyMaterial HDWallet::DeriveKeyMaterial(std::uint32_t index,

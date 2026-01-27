@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "consensus/revealed_pubkeys.hpp"
 #include "consensus/tx_validator.hpp"
@@ -24,6 +25,7 @@ bool ValidateAndApplyBlock(const primitives::CBlock& block, std::uint32_t height
                            std::uint32_t witness_commitment_activation_height,
                            UTXOSet* view,
                            RevealedPubkeySet* revealed_pubkeys,
-                           std::string* error);
+                           std::string* error,
+                           std::vector<primitives::Amount>* tx_fees_out = nullptr);
 
 }  // namespace qryptcoin::consensus
