@@ -114,8 +114,9 @@ bool TestInboundHandshakeThrottle() {
   const std::string address = "203.0.113.5:9375";
   const auto base = std::chrono::steady_clock::now();
 
-  // Default limits: allow a small burst then reject within the window.
-  for (int i = 0; i < 8; ++i) {
+  // Default limits: allow a burst of 32 per host then reject within the window.
+  // (Limit was increased from 8 to 32 to handle burst traffic on seed nodes.)
+  for (int i = 0; i < 32; ++i) {
     if (!qryptcoin::net::PeerManagerTestHelper::AllowInboundBeforeHandshake(manager, address, base)) {
       std::cerr << "expected inbound attempt " << i << " to be allowed\n";
       return false;
