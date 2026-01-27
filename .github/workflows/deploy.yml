@@ -28,7 +28,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        server: [1, 2, 3]
+        server: [1, 2]
     steps:
       - name: Deploy to server ${{ matrix.server }}
         uses: appleboy/ssh-action@v1.0.3
