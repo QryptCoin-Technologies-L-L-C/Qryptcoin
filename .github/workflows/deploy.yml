@@ -3,7 +3,19 @@ name: Deploy
 on:
   push:
     branches: [main]
-  workflow_dispatch:
+    paths:
+      # Only deploy when actual source code or build files change
+      - 'src/**'
+      - 'include/**'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - 'vendor/**'
+      - 'third_party/**'
+      # Exclude documentation, CI config, and other non-binary changes
+      - '!**.md'
+      - '!.github/**'
+      - '!docs/**'
+  workflow_dispatch:  # Manual trigger for when you need to force deploy
 
 permissions:
   contents: read
