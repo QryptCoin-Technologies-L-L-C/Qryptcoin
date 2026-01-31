@@ -27,7 +27,7 @@ This implementation enforces the consensus rules described in the protocol docum
 - **Block Explorer**: [explorer.qryptcoin.org](https://explorer.qryptcoin.org)
 - **Mempool Explorer**: [mempool.qryptcoin.org](https://mempool.qryptcoin.org)
 - **Website**: [qryptcoin.org](https://qryptcoin.org)
-- **Telegram**: [Community](https://t.me/+6_x6VRa_eRZmODBh)
+- **Telegram**: [Community](https://t.me/+uCf5QzVtJxlkM2Ix)
 
 
 ## Repository contents
