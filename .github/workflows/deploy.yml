@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Wait for CI
-        uses: lewagon/wait-on-check-action@v1.3.4
+        uses: lewagon/wait-on-check-action@v1.5.0
         with:
           ref: ${{ github.sha }}
           check-name: 'Build and Test (ubuntu-latest)'
@@ -31,7 +31,7 @@ jobs:
         server: [1, 2]
     steps:
       - name: Deploy to server ${{ matrix.server }}
-        uses: appleboy/ssh-action@v1.0.3
+        uses: appleboy/ssh-action@v1.2.5
         env:
           SUDO_PASS: ${{ secrets[format('SERVER_{0}_SUDO_PASS', matrix.server)] }}
         with:
