@@ -5,6 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: deploy-production
   cancel-in-progress: false
@@ -14,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Wait for CI
-        uses: lewagon/wait-on-check-action@v1.5.0
+        uses: lewagon/wait-on-check-action@a499964d3917700d29a2a8baf3f16b078d609410 # v1.5.0
         with:
           ref: ${{ github.sha }}
           check-name: 'Build and Test (ubuntu-latest)'
@@ -31,7 +34,7 @@ jobs:
         server: [1, 2]
     steps:
       - name: Deploy to server ${{ matrix.server }}
-        uses: appleboy/ssh-action@v1.2.5
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
         env:
           SUDO_PASS: ${{ secrets[format('SERVER_{0}_SUDO_PASS', matrix.server)] }}
         with:
