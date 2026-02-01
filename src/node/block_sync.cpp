@@ -239,7 +239,7 @@ void BlockSyncManager::SetRateLimits(std::size_t inv_per_sec,
 }
 
 std::size_t BlockSyncManager::AnnounceTransaction(const primitives::Hash256& txid,
-                                                  bool force) {
+                                                 bool force) {
   if (!running_) {
     return 0;
   }
@@ -251,6 +251,9 @@ std::size_t BlockSyncManager::AnnounceTransaction(const primitives::Hash256& txi
   const auto msg = net::messages::EncodeInventory(inv);
 
   std::vector<std::shared_ptr<net::PeerSession>> sessions;
+  std::size_t known_skipped = 0;
+  std::size_t rate_limited = 0;
+  std::size_t no_session = 0;
   const auto now = std::chrono::steady_clock::now();
   const auto limit = inv_limit_per_sec_.load();
   {
@@ -259,9 +262,11 @@ std::size_t BlockSyncManager::AnnounceTransaction(const primitives::Hash256& txi
     for (auto& kv : peer_workers_) {
       auto& worker = kv.second;
       if (!worker.session) {
+        ++no_session;
         continue;
       }
       if (!force && worker.known_transactions.find(txid) != worker.known_transactions.end()) {
+        ++known_skipped;
         continue;
       }
       if (limit > 0) {
@@ -271,6 +276,7 @@ std::size_t BlockSyncManager::AnnounceTransaction(const primitives::Hash256& txi
           worker.tx_inv_window_count = 0;
         }
         if (worker.tx_inv_window_count >= limit) {
+          ++rate_limited;
           continue;
         }
       }
@@ -294,6 +300,13 @@ std::size_t BlockSyncManager::AnnounceTransaction(const primitives::Hash256& txi
     if (session && session->Send(msg)) {
       ++sent;
     }
+  }
+  if (sent == 0 && (rate_limited > 0 || known_skipped > 0 || no_session > 0)) {
+    std::cerr << "[relay] warn: tx announcement had no recipients txid=" << HashToHex(txid)
+              << " rate_limited=" << rate_limited
+              << " known_skipped=" << known_skipped
+              << " no_session=" << no_session
+              << "\n";
   }
   return sent;
 }
@@ -910,12 +923,13 @@ void BlockSyncManager::HandleGetData(const net::PeerManager::PeerInfo& info,
 }
 
 void BlockSyncManager::HandleInventory(const net::PeerManager::PeerInfo& info,
-                                       const std::shared_ptr<net::PeerSession>& session,
-                                       const net::messages::InventoryMessage& inventory) {
+                                        const std::shared_ptr<net::PeerSession>& session,
+                                        const net::messages::InventoryMessage& inventory) {
   inventories_received_.fetch_add(inventory.entries.size());
   bool needs_headers = false;
   net::messages::InventoryMessage tx_request;
   std::vector<primitives::Hash256> requested_txids;
+  std::size_t dropped_tx_inv = 0;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it_worker = peer_workers_.find(info.id);
@@ -937,6 +951,7 @@ void BlockSyncManager::HandleInventory(const net::PeerManager::PeerInfo& info,
         needs_headers = true;
       } else if (entry.type == net::messages::InventoryType::kTransaction && has_transaction_) {
         if (tx_request.entries.size() >= 1024) {
+          ++dropped_tx_inv;
           if (needs_headers) {
             break;
           }
@@ -979,6 +994,10 @@ void BlockSyncManager::HandleInventory(const net::PeerManager::PeerInfo& info,
         break;
       }
     }
+  }
+  if (dropped_tx_inv > 0) {
+    std::cerr << "[relay] warn: peer " << info.id
+              << " inventory truncated dropped_tx=" << dropped_tx_inv << "\n";
   }
   if (needs_headers) {
     SendGetHeaders(info, session);

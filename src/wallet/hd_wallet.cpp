@@ -765,6 +765,13 @@ std::vector<std::string> HDWallet::ListWatchOnlyAddresses() const {
   return result;
 }
 
+std::size_t HDWallet::PurgeUtxos() {
+  const std::size_t count = utxos_.size();
+  utxos_.clear();
+  transactions_.clear();
+  return count;
+}
+
 bool HDWallet::ForgetAddress(const std::string& address) {
   auto it = address_index_.find(address);
   if (it == address_index_.end()) {

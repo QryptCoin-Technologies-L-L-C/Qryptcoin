@@ -56,11 +56,20 @@ void RollingFeeEstimator::AddConfirmation(double fee_rate_miks_per_vb,
 
 double RollingFeeEstimator::EstimateFeeRate(
     std::uint32_t target_blocks, double mempool_min_fee_miks_per_vb) const {
+  return EstimateFee(target_blocks, mempool_min_fee_miks_per_vb).feerate_miks_per_vb;
+}
+
+RollingFeeEstimator::FeeEstimate RollingFeeEstimator::EstimateFee(
+    std::uint32_t target_blocks, double mempool_min_fee_miks_per_vb) const {
+  FeeEstimate estimate;
   if (target_blocks == 0) {
     target_blocks = 1;
   }
+  estimate.sample_count = samples_.size();
   if (samples_.empty()) {
-    return mempool_min_fee_miks_per_vb;
+    estimate.feerate_miks_per_vb = mempool_min_fee_miks_per_vb;
+    estimate.used_fallback = true;
+    return estimate;
   }
   // Work on a copy so we can sort without mutating the internal order.
   std::vector<Sample> sorted = samples_;
@@ -73,8 +82,11 @@ double RollingFeeEstimator::EstimateFeeRate(
   for (const auto& s : sorted) {
     total_weight += s.weight;
   }
+  estimate.total_weight = total_weight;
   if (total_weight <= 0.0) {
-    return mempool_min_fee_miks_per_vb;
+    estimate.feerate_miks_per_vb = mempool_min_fee_miks_per_vb;
+    estimate.used_fallback = true;
+    return estimate;
   }
 
   // We look for the lowest fee rate such that at least 80% of the weight
@@ -98,13 +110,18 @@ double RollingFeeEstimator::EstimateFeeRate(
 
   if (best_fee <= 0.0) {
     // Not enough successful confirmations at this target; fall back.
-    return mempool_min_fee_miks_per_vb;
+    estimate.feerate_miks_per_vb = mempool_min_fee_miks_per_vb;
+    estimate.used_fallback = true;
+    return estimate;
   }
   // Never suggest a fee below the current mempool floor.
   if (best_fee < mempool_min_fee_miks_per_vb) {
-    return mempool_min_fee_miks_per_vb;
+    estimate.feerate_miks_per_vb = mempool_min_fee_miks_per_vb;
+    estimate.clamped_to_floor = true;
+    return estimate;
   }
-  return best_fee;
+  estimate.feerate_miks_per_vb = best_fee;
+  return estimate;
 }
 
 }  // namespace qryptcoin::policy

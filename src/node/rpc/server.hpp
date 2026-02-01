@@ -80,6 +80,7 @@ class RpcServer {
   nlohmann::json HandleListUtxos() const;
   nlohmann::json HandleListAddresses() const;
   nlohmann::json HandleForgetAddresses(const nlohmann::json& params);
+  nlohmann::json HandlePurgeUtxos();
   nlohmann::json HandleImportAddress(const nlohmann::json& params);
   nlohmann::json HandleListWatchOnly() const;
   nlohmann::json HandleRemoveWatchOnly(const nlohmann::json& params);
@@ -123,7 +124,9 @@ class RpcServer {
   std::string DefaultMiningAddress() const;
   void IndexWalletOutputs(const primitives::CBlock& block, bool save_wallet = true);
   void AnnounceBlock(const primitives::Hash256& hash);
-  void BroadcastTransaction(const primitives::CTransaction& tx);
+  std::size_t BroadcastTransaction(const primitives::CTransaction& tx);
+  void QueueTransactionRelayRetry(const primitives::Hash256& txid);
+  void ProcessRelayRetryQueue(std::chrono::steady_clock::time_point now);
 
   struct Hash256Hasher {
     std::size_t operator()(const primitives::Hash256& hash) const noexcept {
@@ -245,6 +248,19 @@ class RpcServer {
   std::chrono::seconds mempool_persist_interval_{std::chrono::seconds(60)};
   std::atomic<bool> mempool_dirty_{false};
   std::jthread mempool_maintenance_thread_;
+
+  struct RelayRetryEntry {
+    std::chrono::steady_clock::time_point first_scheduled{};
+    std::chrono::steady_clock::time_point next_attempt{};
+    std::uint32_t attempts{0};
+  };
+  mutable std::mutex relay_retry_mutex_;
+  std::unordered_map<primitives::Hash256, RelayRetryEntry, Hash256Hasher> relay_retry_queue_;
+  std::atomic<std::uint64_t> relay_broadcast_attempts_total_{0};
+  std::atomic<std::uint64_t> relay_broadcast_success_total_{0};
+  std::atomic<std::uint64_t> relay_broadcast_zero_peer_total_{0};
+  std::atomic<std::uint64_t> relay_broadcast_retry_scheduled_total_{0};
+  std::atomic<std::uint64_t> relay_broadcast_retry_success_total_{0};
 
   // Simple tracking of peers added via addnode so operators can
   // inspect them with getaddednodeinfo.
