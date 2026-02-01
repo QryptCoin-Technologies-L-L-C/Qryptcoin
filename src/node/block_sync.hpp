@@ -78,6 +78,7 @@ class BlockSyncManager {
 
   std::size_t BestHeaderHeight() const;
   bool IsSynced() const;
+  bool IsRunning() const { return running_.load(); }
   SyncStats GetStats() const;
   std::vector<PeerSyncStats> GetPeerSyncStats() const;
   void SetRateLimits(std::size_t inv_per_sec,

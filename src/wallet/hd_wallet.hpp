@@ -181,6 +181,11 @@ class HDWallet {
   bool RemoveWatchOnlyAddress(const std::string& address);
   // Return the set of watch-only addresses currently tracked.
   std::vector<std::string> ListWatchOnlyAddresses() const;
+  // Clear all tracked UTXOs from the wallet. This is useful when the wallet
+  // has stale UTXO entries that no longer exist on the blockchain (e.g., after
+  // importing a wallet from a different chain). After purging, the wallet
+  // should be rescanned to rebuild the UTXO set from the current chain state.
+  std::size_t PurgeUtxos();
   // Ensure that the HD keychain maintains at least `gap_limit` consecutive
   // unused addresses at the tail of the derived range. This provides a
   // simple keypool-style buffer so rescans can safely discover funds sent

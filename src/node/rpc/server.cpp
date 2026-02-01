@@ -657,6 +657,8 @@ nlohmann::json RpcServer::Handle(const nlohmann::json& request) {
       response["result"] = HandleListAddresses();
     } else if (method == "forgetaddresses") {
       response["result"] = HandleForgetAddresses(params);
+    } else if (method == "purgeutxos") {
+      response["result"] = HandlePurgeUtxos();
     } else if (method == "importaddress") {
       response["result"] = HandleImportAddress(params);
     } else if (method == "listwatchonly") {
@@ -1483,6 +1485,17 @@ nlohmann::json RpcServer::HandleForgetAddresses(const nlohmann::json& params) {
   return result;
 }
 
+nlohmann::json RpcServer::HandlePurgeUtxos() {
+  auto& wallet = WalletOrThrow();
+  const std::size_t purged_count = wallet.PurgeUtxos();
+  wallet.Save();
+  nlohmann::json result;
+  result["purged_utxos"] = purged_count;
+  result["status"] = "success";
+  result["message"] = "UTXO cache cleared. Run a wallet rescan to rebuild from chain state.";
+  return result;
+}
+
 nlohmann::json RpcServer::HandleSendToAddress(const nlohmann::json& params) {
   if (!params.contains("address") || !params.contains("amount")) {
     throw std::runtime_error("address and amount are required");
@@ -1495,12 +1508,16 @@ nlohmann::json RpcServer::HandleSendToAddress(const nlohmann::json& params) {
   }
   primitives::Amount fee_rate = 0;
   bool manual_fee = false;
+  bool require_broadcast = false;
   if (params.contains("fee_rate")) {
     if (!params.at("fee_rate").is_number_integer()) {
       throw std::runtime_error("fee_rate must be an integer");
     }
     fee_rate = params.at("fee_rate").get<std::uint64_t>();
     manual_fee = true;
+  }
+  if (params.contains("require_broadcast")) {
+    require_broadcast = params.at("require_broadcast").get<bool>();
   }
   if (!primitives::MoneyRange(fee_rate)) {
     throw std::runtime_error("fee_rate out of range");
@@ -1515,9 +1532,18 @@ nlohmann::json RpcServer::HandleSendToAddress(const nlohmann::json& params) {
       // transactions still relay on quiet networks.
       suggested = mempool_min_fee_miks_per_vb_ > 0.0 ? mempool_min_fee_miks_per_vb_ : 1.0;
     }
-    const double ceiled = std::ceil(suggested);
+    // The wallet API currently expects an integer fee rate (Miks/vB). Round the
+    // estimate and clamp to at least the current mempool floor so we don't
+    // accidentally underpay relative to relay policy.
+    double rounded = std::round(suggested);
+    if (rounded < mempool_min_fee_miks_per_vb_) {
+      rounded = std::ceil(mempool_min_fee_miks_per_vb_);
+    }
+    if (rounded < 1.0) {
+      rounded = 1.0;
+    }
     primitives::Amount converted = 0;
-    if (!DoubleToMoney(ceiled, &converted)) {
+    if (!DoubleToMoney(rounded, &converted)) {
       throw std::runtime_error("fee_rate out of range");
     }
     fee_rate = converted;
@@ -1532,21 +1558,32 @@ nlohmann::json RpcServer::HandleSendToAddress(const nlohmann::json& params) {
 
   std::string reject_reason;
   const bool accepted = AddToMempool(tx, std::nullopt, &reject_reason);
-  if (accepted) {
-    std::string commit_error;
-    if (!wallet.CommitTransaction(*created, &commit_error)) {
-      throw std::runtime_error("wallet commit failed: " + commit_error);
+  if (!accepted) {
+    if (reject_reason.empty()) {
+      reject_reason = "rejected";
     }
-    wallet.Save();
-    BroadcastTransaction(tx);
+    throw std::runtime_error("transaction rejected: " + reject_reason);
+  }
+  std::string commit_error;
+  if (!wallet.CommitTransaction(*created, &commit_error)) {
+    throw std::runtime_error("wallet commit failed: " + commit_error);
+  }
+  wallet.Save();
+  const std::size_t broadcast_peers = BroadcastTransaction(tx);
+  if (require_broadcast && broadcast_peers == 0) {
+    throw std::runtime_error("transaction accepted but not broadcast to any peers: " +
+                             TxIdHex(tx));
   }
   nlohmann::json result;
   result["txid"] = TxIdHex(tx);
   result["hex"] = SerializeTransactionHex(tx);
   result["metadata"] = TxToJson(tx, wallet_.get(), created->fee);
   result["accepted_to_mempool"] = accepted;
-  if (!accepted && !reject_reason.empty()) {
-    result["rejection_reason"] = reject_reason;
+  result["broadcast_peers"] = broadcast_peers;
+  result["broadcasted"] = broadcast_peers > 0;
+  if (broadcast_peers == 0) {
+    result["broadcast_warning"] =
+        "transaction accepted locally but was not announced to any peers";
   }
   return result;
 }
@@ -2041,6 +2078,18 @@ nlohmann::json RpcServer::HandleGetHealth() const {
   }
   result["peers"] = peers_json;
 
+  nlohmann::json relay_json;
+  relay_json["broadcast_attempts_total"] = relay_broadcast_attempts_total_.load(std::memory_order_relaxed);
+  relay_json["broadcast_success_total"] = relay_broadcast_success_total_.load(std::memory_order_relaxed);
+  relay_json["broadcast_zero_peer_total"] = relay_broadcast_zero_peer_total_.load(std::memory_order_relaxed);
+  relay_json["retry_scheduled_total"] = relay_broadcast_retry_scheduled_total_.load(std::memory_order_relaxed);
+  relay_json["retry_success_total"] = relay_broadcast_retry_success_total_.load(std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lock(relay_retry_mutex_);
+    relay_json["retry_queue_size"] = relay_retry_queue_.size();
+  }
+  result["relay"] = relay_json;
+
   // High-level status and basic warnings for operators.
   nlohmann::json warnings = nlohmann::json::array();
   const bool ok_chain = (blocks > 0);
@@ -2331,10 +2380,34 @@ nlohmann::json RpcServer::HandleGetRawTransaction(const nlohmann::json& params) 
 }
 
 nlohmann::json RpcServer::HandleSendRawTransaction(const nlohmann::json& params) {
-  if (!params.is_object() || !params.contains("hex")) {
-    throw std::runtime_error("sendrawtransaction expects params.hex");
+  std::string hex;
+  bool verbose = false;
+  bool require_broadcast = false;
+  if (params.is_array()) {
+    if (params.empty() || !params.at(0).is_string()) {
+      throw std::runtime_error("sendrawtransaction expects params[0] hex string");
+    }
+    hex = params.at(0).get<std::string>();
+    if (params.size() >= 2 && params.at(1).is_boolean()) {
+      verbose = params.at(1).get<bool>();
+    }
+    if (params.size() >= 3 && params.at(2).is_boolean()) {
+      require_broadcast = params.at(2).get<bool>();
+    }
+  } else if (params.is_object()) {
+    if (!params.contains("hex") || !params.at("hex").is_string()) {
+      throw std::runtime_error("sendrawtransaction expects params.hex");
+    }
+    hex = params.at("hex").get<std::string>();
+    if (params.contains("verbose")) {
+      verbose = params.at("verbose").get<bool>();
+    }
+    if (params.contains("require_broadcast")) {
+      require_broadcast = params.at("require_broadcast").get<bool>();
+    }
+  } else {
+    throw std::runtime_error("sendrawtransaction expects params object or array");
   }
-  const auto hex = params.at("hex").get<std::string>();
   std::vector<std::uint8_t> raw;
   if (!util::HexDecode(hex, &raw)) {
     throw std::runtime_error("invalid hex");
@@ -2358,10 +2431,28 @@ nlohmann::json RpcServer::HandleSendRawTransaction(const nlohmann::json& params)
     }
     throw std::runtime_error("transaction rejected: " + reject_reason);
   }
-  BroadcastTransaction(tx);
 
   const auto txid = primitives::ComputeTxId(tx);
-  return HashToHex(txid);
+  const std::size_t broadcast_peers = BroadcastTransaction(tx);
+  if (require_broadcast && broadcast_peers == 0) {
+    throw std::runtime_error("transaction accepted but not broadcast to any peers: " +
+                             HashToHex(txid));
+  }
+
+  if (!verbose) {
+    return HashToHex(txid);
+  }
+
+  nlohmann::json result;
+  result["txid"] = HashToHex(txid);
+  result["accepted_to_mempool"] = true;
+  result["broadcast_peers"] = broadcast_peers;
+  result["broadcasted"] = broadcast_peers > 0;
+  if (broadcast_peers == 0) {
+    result["broadcast_warning"] =
+        "transaction accepted locally but was not announced to any peers";
+  }
+  return result;
 }
 
 nlohmann::json RpcServer::HandleEstimateSmartFee(const nlohmann::json& params) const {
@@ -2374,10 +2465,189 @@ nlohmann::json RpcServer::HandleEstimateSmartFee(const nlohmann::json& params) c
   if (target_blocks == 0) {
     target_blocks = 1;
   }
-  double fee_rate = fee_estimator_.EstimateFeeRate(target_blocks, mempool_min_fee_miks_per_vb_);
+  const auto rolling =
+      fee_estimator_.EstimateFee(target_blocks, mempool_min_fee_miks_per_vb_);
+
+  constexpr std::uint64_t kAssumedMaxBlockBytes = 1'000'000ULL;
+  const std::uint64_t mempool_target_bytes =
+      static_cast<std::uint64_t>(target_blocks) * kAssumedMaxBlockBytes;
+
+  std::size_t mempool_entries = 0;
+  std::uint64_t mempool_bytes = 0;
+  double mempool_pressure_feerate = 0.0;
+  {
+    std::lock_guard<std::mutex> lock(mempool_mutex_);
+    mempool_entries = mempool_by_txid_.size();
+    mempool_bytes = mempool_bytes_;
+    if (!mempool_fee_index_.empty() && mempool_target_bytes > 0) {
+      std::uint64_t cumulative = 0;
+      for (auto it = mempool_fee_index_.rbegin(); it != mempool_fee_index_.rend(); ++it) {
+        auto it_entry = mempool_by_txid_.find(it->txid);
+        if (it_entry == mempool_by_txid_.end()) {
+          continue;
+        }
+        const auto& entry = it_entry->second;
+        if (entry.size_bytes == 0) {
+          continue;
+        }
+        if (cumulative > std::numeric_limits<std::uint64_t>::max() - entry.size_bytes) {
+          cumulative = std::numeric_limits<std::uint64_t>::max();
+        } else {
+          cumulative += entry.size_bytes;
+        }
+        if (cumulative >= mempool_target_bytes) {
+          mempool_pressure_feerate = entry.feerate_miks_per_vb;
+          break;
+        }
+      }
+    }
+  }
+  double mempool_feerate = mempool_pressure_feerate;
+  if (mempool_feerate < mempool_min_fee_miks_per_vb_) {
+    mempool_feerate = mempool_min_fee_miks_per_vb_;
+  }
+
+  constexpr std::size_t kRecentBlockLookback = 72;
+  std::size_t recent_blocks_scanned = 0;
+  std::size_t recent_block_samples = 0;
+  double recent_block_feerate = 0.0;
+  {
+    const std::size_t chain_blocks = chain_.BlockCount();
+    if (chain_blocks > 1) {
+      const std::size_t tip_height = chain_blocks - 1;
+      const std::size_t lookback = std::min<std::size_t>(kRecentBlockLookback, tip_height + 1);
+      const std::size_t start_height = (tip_height + 1) - lookback;
+
+      std::vector<double> feerates;
+      feerates.reserve(1024);
+      for (std::size_t height = start_height; height <= tip_height; ++height) {
+        const auto* rec = chain_.GetByHeight(height);
+        if (!rec) {
+          continue;
+        }
+        primitives::CBlock block;
+        std::string error;
+        if (!chain_.ReadBlock(*rec, &block, &error)) {
+          continue;
+        }
+        ++recent_blocks_scanned;
+        for (std::size_t i = 1; i < block.transactions.size(); ++i) {
+          const auto& tx = block.transactions[i];
+          const auto txid = primitives::ComputeTxId(tx);
+          primitives::Amount fee_miks = 0;
+          if (!chain_.GetTxFee(txid, &fee_miks)) {
+            continue;
+          }
+          const std::uint64_t vbytes = ComputeTransactionVBytes(tx);
+          if (vbytes == 0) {
+            continue;
+          }
+          const double fr =
+              static_cast<double>(fee_miks) / static_cast<double>(vbytes);
+          if (std::isfinite(fr) && fr > 0.0) {
+            feerates.push_back(fr);
+          }
+        }
+      }
+
+      recent_block_samples = feerates.size();
+      if (!feerates.empty()) {
+        std::sort(feerates.begin(), feerates.end());
+        double q = 0.75;
+        if (target_blocks <= 1) {
+          q = 0.90;
+        } else if (target_blocks <= 3) {
+          q = 0.75;
+        } else if (target_blocks <= 6) {
+          q = 0.60;
+        } else if (target_blocks <= 12) {
+          q = 0.50;
+        } else {
+          q = 0.40;
+        }
+        const std::size_t idx = static_cast<std::size_t>(
+            std::clamp(q, 0.0, 1.0) * static_cast<double>(feerates.size() - 1));
+        recent_block_feerate = feerates[idx];
+      }
+    }
+  }
+  if (recent_block_samples > 0 && recent_block_feerate < mempool_min_fee_miks_per_vb_) {
+    recent_block_feerate = mempool_min_fee_miks_per_vb_;
+  }
+
+  double feerate = rolling.feerate_miks_per_vb;
+  std::string source = rolling.used_fallback ? "mempool_floor" : "rolling_estimator";
+  if (mempool_feerate > feerate + 1e-12) {
+    feerate = mempool_feerate;
+    source = "mempool_pressure";
+  } else if (rolling.used_fallback && recent_block_feerate > feerate + 1e-12) {
+    feerate = recent_block_feerate;
+    source = "recent_blocks";
+  }
+
+  bool reliable = false;
+  double confidence = 0.0;
+  std::string warning;
+  if (source == "rolling_estimator") {
+    constexpr std::size_t kReliableSampleThreshold = 12;
+    reliable = rolling.sample_count >= kReliableSampleThreshold && !rolling.used_fallback;
+    confidence =
+        rolling.sample_count == 0
+            ? 0.0
+            : std::min(1.0, static_cast<double>(rolling.sample_count) /
+                                static_cast<double>(kReliableSampleThreshold));
+    if (!reliable) {
+      warning = "limited fee estimate data; result may be unreliable";
+    }
+  } else if (source == "mempool_pressure") {
+    const double ratio =
+        mempool_target_bytes == 0
+            ? 0.0
+            : std::min(1.0, static_cast<double>(mempool_bytes) /
+                                static_cast<double>(mempool_target_bytes));
+    confidence = ratio;
+    reliable = ratio >= 1.0 && mempool_entries > 0;
+    if (!reliable) {
+      warning = "estimate based on local mempool; limited data for requested target";
+    }
+  } else if (source == "recent_blocks") {
+    constexpr std::size_t kBlockSampleThreshold = 50;
+    confidence =
+        recent_block_samples == 0
+            ? 0.0
+            : std::min(1.0, static_cast<double>(recent_block_samples) /
+                                static_cast<double>(kBlockSampleThreshold));
+    reliable = recent_block_samples >= kBlockSampleThreshold;
+    if (!reliable) {
+      warning = "estimate based on recent blocks; limited sample size";
+    }
+  } else {
+    reliable = false;
+    confidence = 0.0;
+    warning = "insufficient fee data; returning mempool floor";
+  }
   nlohmann::json result;
-  result["feerate"] = fee_rate;
+  result["feerate"] = feerate;
   result["blocks"] = target_blocks;
+  result["mempoolminfee"] = mempool_min_fee_miks_per_vb_;
+  result["minrelaytxfee"] = kMinRelayFeeMiksPerVb;
+  result["samples"] = static_cast<std::uint64_t>(rolling.sample_count);
+  result["total_weight"] = rolling.total_weight;
+  result["used_fallback"] = rolling.used_fallback;
+  result["clamped_to_floor"] = rolling.clamped_to_floor;
+  result["reliable"] = reliable;
+  result["confidence"] = confidence;
+  result["source"] = source;
+  if (!warning.empty()) {
+    result["warning"] = warning;
+  }
+  result["mempool_entries"] = static_cast<std::uint64_t>(mempool_entries);
+  result["mempool_bytes"] = mempool_bytes;
+  result["mempool_target_bytes"] = mempool_target_bytes;
+  result["mempool_pressure_feerate"] = mempool_pressure_feerate;
+  result["recent_blocks_scanned"] = static_cast<std::uint64_t>(recent_blocks_scanned);
+  result["recent_block_samples"] = static_cast<std::uint64_t>(recent_block_samples);
+  result["recent_block_feerate"] = recent_block_feerate;
   return result;
 }
 
@@ -3247,25 +3517,146 @@ void RpcServer::AnnounceBlock(const primitives::Hash256& hash) {
   peers_->BroadcastInventory(inv);
 }
 
-void RpcServer::BroadcastTransaction(const primitives::CTransaction& tx) {
-  if (sync_ != nullptr) {
-    const auto txid = primitives::ComputeTxId(tx);
-    const std::size_t announced = sync_->AnnounceTransaction(txid);
-    std::cerr << "[relay] tx announced " << HashToHex(txid) << " peers=" << announced << "\n";
-    return;
-  }
-  if (peers_ == nullptr) {
-    return;
-  }
-  net::messages::InventoryMessage inv;
-  net::messages::InventoryVector vec;
-  vec.type = net::messages::InventoryType::kTransaction;
+std::size_t RpcServer::BroadcastTransaction(const primitives::CTransaction& tx) {
   const auto txid = primitives::ComputeTxId(tx);
-  std::copy(txid.begin(), txid.end(), vec.identifier.begin());
-  inv.entries.push_back(vec);
-  peers_->BroadcastInventory(inv);
-  std::cerr << "[relay] tx announced " << HashToHex(txid)
-            << " peers=" << peers_->GetPeerInfos().size() << "\n";
+  relay_broadcast_attempts_total_.fetch_add(1, std::memory_order_relaxed);
+
+  std::size_t announced = 0;
+  if (sync_ != nullptr && sync_->IsRunning()) {
+    announced = sync_->AnnounceTransaction(txid);
+  } else if (peers_ != nullptr) {
+    net::messages::InventoryMessage inv;
+    net::messages::InventoryVector vec;
+    vec.type = net::messages::InventoryType::kTransaction;
+    std::copy(txid.begin(), txid.end(), vec.identifier.begin());
+    inv.entries.push_back(vec);
+    peers_->BroadcastInventory(inv);
+    announced = peers_->GetPeerInfos().size();
+  }
+
+  if (announced == 0 && peers_ == nullptr && sync_ != nullptr && !sync_->IsRunning()) {
+    std::cerr << "[relay] warn: tx broadcast skipped (sync manager not running) txid="
+              << HashToHex(txid) << "\n";
+  } else if (peers_ == nullptr && sync_ == nullptr) {
+    std::cerr << "[relay] warn: tx broadcast skipped (no peer manager) txid="
+              << HashToHex(txid) << "\n";
+  }
+
+  if (announced > 0) {
+    relay_broadcast_success_total_.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    relay_broadcast_zero_peer_total_.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  std::cerr << (announced > 0 ? "[relay] tx announced " : "[relay] warn: tx announced ")
+            << HashToHex(txid) << " peers=" << announced << "\n";
+
+  if (announced == 0) {
+    QueueTransactionRelayRetry(txid);
+  }
+  return announced;
+}
+
+void RpcServer::QueueTransactionRelayRetry(const primitives::Hash256& txid) {
+  if (sync_ == nullptr && peers_ == nullptr) {
+    return;
+  }
+  if (!HasMempoolTransaction(txid)) {
+    return;
+  }
+
+  const auto now = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lock(relay_retry_mutex_);
+  auto [it, inserted] = relay_retry_queue_.emplace(txid, RelayRetryEntry{});
+  auto& entry = it->second;
+  if (inserted || entry.first_scheduled.time_since_epoch().count() == 0) {
+    entry.first_scheduled = now;
+    entry.attempts = 0;
+    relay_broadcast_retry_scheduled_total_.fetch_add(1, std::memory_order_relaxed);
+  }
+  const auto scheduled = now + std::chrono::seconds(1);
+  if (entry.next_attempt.time_since_epoch().count() == 0 || scheduled < entry.next_attempt) {
+    entry.next_attempt = scheduled;
+  }
+}
+
+void RpcServer::ProcessRelayRetryQueue(std::chrono::steady_clock::time_point now) {
+  if (sync_ == nullptr && peers_ == nullptr) {
+    return;
+  }
+
+  std::vector<primitives::Hash256> due;
+  {
+    std::lock_guard<std::mutex> lock(relay_retry_mutex_);
+    if (relay_retry_queue_.empty()) {
+      return;
+    }
+    due.reserve(relay_retry_queue_.size());
+    for (const auto& kv : relay_retry_queue_) {
+      if (kv.second.next_attempt.time_since_epoch().count() == 0) {
+        continue;
+      }
+      if (now >= kv.second.next_attempt) {
+        due.push_back(kv.first);
+      }
+    }
+  }
+
+  if (due.empty()) {
+    return;
+  }
+
+  for (const auto& txid : due) {
+    if (!HasMempoolTransaction(txid)) {
+      std::lock_guard<std::mutex> lock(relay_retry_mutex_);
+      relay_retry_queue_.erase(txid);
+      continue;
+    }
+
+    std::size_t announced = 0;
+    if (sync_ != nullptr && sync_->IsRunning()) {
+      announced = sync_->AnnounceTransaction(txid, /*force=*/true);
+    } else if (peers_ != nullptr) {
+      net::messages::InventoryMessage inv;
+      net::messages::InventoryVector vec;
+      vec.type = net::messages::InventoryType::kTransaction;
+      std::copy(txid.begin(), txid.end(), vec.identifier.begin());
+      inv.entries.push_back(vec);
+      peers_->BroadcastInventory(inv);
+      announced = peers_->GetPeerInfos().size();
+    }
+
+    std::lock_guard<std::mutex> lock(relay_retry_mutex_);
+    auto it = relay_retry_queue_.find(txid);
+    if (it == relay_retry_queue_.end()) {
+      continue;
+    }
+
+    if (announced > 0) {
+      relay_broadcast_retry_success_total_.fetch_add(1, std::memory_order_relaxed);
+      relay_retry_queue_.erase(it);
+      std::cerr << "[relay] retry tx announced " << HashToHex(txid)
+                << " peers=" << announced << "\n";
+      continue;
+    }
+
+    auto& entry = it->second;
+    constexpr std::uint32_t kMaxAttempts = 10;
+    constexpr auto kMaxAge = std::chrono::minutes(10);
+    if (entry.first_scheduled.time_since_epoch().count() != 0 &&
+        now - entry.first_scheduled > kMaxAge) {
+      relay_retry_queue_.erase(it);
+      continue;
+    }
+    if (entry.attempts >= kMaxAttempts) {
+      relay_retry_queue_.erase(it);
+      continue;
+    }
+    ++entry.attempts;
+    const std::uint32_t exp = std::min<std::uint32_t>(entry.attempts, 6);
+    const auto delay = std::chrono::seconds(1ULL << exp);
+    entry.next_attempt = now + delay;
+  }
 }
 
 void RpcServer::RescanWallet(std::size_t start_height, bool force_start_height) {
@@ -4159,6 +4550,8 @@ void RpcServer::MempoolMaintenanceLoop(std::stop_token stop) {
       RebroadcastMempool();
       next_rebroadcast = now + mempool_rebroadcast_interval_;
     }
+
+    ProcessRelayRetryQueue(now);
 
     if (!mempool_persist_path_.empty() && now >= next_persist) {
       const bool dirty = mempool_dirty_.exchange(false, std::memory_order_relaxed);

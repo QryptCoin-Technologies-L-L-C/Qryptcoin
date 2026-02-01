@@ -248,6 +248,7 @@ void PrintUsage() {
             << "  listwatchonly\n"
             << "  removewatchonly <address...>\n"
             << "  listtransactions [count]\n"
+            << "  purgeutxos                Clear stale UTXOs (requires rescan after)\n"
             << "  getnetworkinfo\n"
             << "  getpeerinfo\n"
             << "  addnode <address[:port]> [--address=<address[:port]>]\n"
@@ -691,7 +692,7 @@ nlohmann::json BuildRequest(const CliOptions& opts) {
       }
     }
   } else if (command == "getwalletinfo" || command == "listaddresses" ||
-             command == "listwatchonly") {
+             command == "listwatchonly" || command == "purgeutxos") {
     // no params
   } else if (command == "listtransactions") {
     if (opts.args.size() >= 2) {
@@ -1115,6 +1116,18 @@ void PrintResponse(const CliOptions& opts, const nlohmann::json& response) {
       for (const auto& w : warnings) {
         std::cout << "  - " << w.get<std::string>() << "\n";
       }
+    }
+  } else if (command == "estimatesmartfee") {
+    const auto& result = response.at("result");
+    std::cout << "feerate=" << result.value("feerate", 0.0)
+              << " miks/vB"
+              << " blocks=" << result.value("blocks", 0ULL)
+              << " reliable=" << (result.value("reliable", false) ? "true" : "false")
+              << " confidence=" << result.value("confidence", 0.0)
+              << " source=" << result.value("source", std::string{"?"})
+              << "\n";
+    if (result.contains("warning") && result.at("warning").is_string()) {
+      std::cout << "warning: " << result.at("warning").get<std::string>() << "\n";
     }
   } else {
     std::cout << response["result"].dump(2) << "\n";

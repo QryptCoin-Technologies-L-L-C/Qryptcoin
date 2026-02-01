@@ -13,6 +13,14 @@ namespace qryptcoin::policy {
 // Fee rates are expressed in Miks per virtual byte.
 class RollingFeeEstimator {
  public:
+  struct FeeEstimate {
+    double feerate_miks_per_vb{0.0};
+    std::size_t sample_count{0};
+    double total_weight{0.0};
+    bool used_fallback{false};
+    bool clamped_to_floor{false};
+  };
+
   RollingFeeEstimator(double decay, std::size_t max_samples);
 
   // Record a transaction that confirmed after |confirm_blocks| blocks at the
@@ -24,6 +32,9 @@ class RollingFeeEstimator {
   // fallback.
   double EstimateFeeRate(std::uint32_t target_blocks,
                          double mempool_min_fee_miks_per_vb) const;
+
+  FeeEstimate EstimateFee(std::uint32_t target_blocks,
+                          double mempool_min_fee_miks_per_vb) const;
 
   // Update configuration at runtime (used by operator CLI flags).
   void Configure(double decay, std::size_t max_samples);
