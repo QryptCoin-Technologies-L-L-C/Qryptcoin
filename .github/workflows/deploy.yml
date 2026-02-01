@@ -46,7 +46,7 @@ jobs:
         server: [1, 2]
     steps:
       - name: Deploy to server ${{ matrix.server }}
-        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        uses: appleboy/ssh-action@v1.2.0
         env:
           SUDO_PASS: ${{ secrets[format('SERVER_{0}_SUDO_PASS', matrix.server)] }}
         with:
@@ -54,7 +54,6 @@ jobs:
           username: ${{ secrets[format('SERVER_{0}_USER', matrix.server)] }}
           key: ${{ secrets[format('SERVER_{0}_SSH_KEY', matrix.server)] }}
           envs: SUDO_PASS
-          script_stop: true
           command_timeout: 30m
           script: ${{ secrets[format('SERVER_{0}_DEPLOY_SCRIPT', matrix.server)] }}
 
