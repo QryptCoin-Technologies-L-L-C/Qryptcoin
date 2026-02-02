@@ -11,7 +11,14 @@ cd "${ROOT_DIR}"
 
 mkdir -p "${OUT_DIR}"
 
-./scripts/build/package.sh "${BUILD_TYPE}" "${BUILD_DIR}" "${GENERATOR}"
+echo "==> configuring (${BUILD_TYPE})"
+cmake -S . -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE="${BUILD_TYPE}"
+
+echo "==> building"
+cmake --build "${BUILD_DIR}" --parallel
+
+echo "==> packaging (${GENERATOR})"
+(cd "${BUILD_DIR}" && cpack -G "${GENERATOR}")
 
 mapfile -t packages < <(ls -1t "${BUILD_DIR}"/*.tar.gz "${BUILD_DIR}"/*.tgz 2>/dev/null || true)
 if [[ ${#packages[@]} -eq 0 ]]; then

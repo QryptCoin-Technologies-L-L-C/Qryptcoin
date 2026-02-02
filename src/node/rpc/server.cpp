@@ -200,6 +200,20 @@ std::string AlgoToString(crypto::SignatureAlgorithm algo) {
   return "DIL";
 }
 
+std::string UtxoStateToString(wallet::UTXOState state) {
+  switch (state) {
+    case wallet::UTXOState::kAvailable:
+      return "available";
+    case wallet::UTXOState::kPending:
+      return "pending";
+    case wallet::UTXOState::kSpent:
+      return "spent";
+    case wallet::UTXOState::kOrphaned:
+      return "orphaned";
+  }
+  return "unknown";
+}
+
 std::string HashToHex(const primitives::Hash256& hash) {
   return util::HexEncode(std::span<const std::uint8_t>(hash.begin(), hash.size()));
 }
@@ -478,7 +492,7 @@ bool IsWalletMethod(const std::string& method) {
       "listtransactions",  "listutxos",        "listaddresses",
       "forgetaddresses",   "importaddress",    "listwatchonly",
       "removewatchonly",   "getpqinfo",        "createwallet",
-      "loadwallet",
+      "loadwallet",        "purgeutxos",       "resyncwallet",
       "backupwallet",      "encryptwallet",    "walletlock",
       "walletpassphrase"};
   return kWalletMethods.find(method) != kWalletMethods.end();
@@ -648,6 +662,8 @@ nlohmann::json RpcServer::Handle(const nlohmann::json& request) {
       ++count;
     }
 
+    ProcessWalletRollbackQueue();
+
     if (IsWalletMethod(method)) {
       if (!WalletEnabled()) {
         ThrowRpcError(-32601, "wallet disabled");
@@ -713,6 +729,8 @@ nlohmann::json RpcServer::Handle(const nlohmann::json& request) {
       response["result"] = HandleForgetAddresses(params);
     } else if (method == "purgeutxos") {
       response["result"] = HandlePurgeUtxos();
+    } else if (method == "resyncwallet") {
+      response["result"] = HandleResyncWallet(params);
     } else if (method == "importaddress") {
       response["result"] = HandleImportAddress(params);
     } else if (method == "listwatchonly") {
@@ -1480,9 +1498,32 @@ nlohmann::json RpcServer::HandleGetWalletInfo() const {
   const auto& wallet = WalletOrThrow();
   const auto spendable = wallet.GetBalance();
   const auto watch_only = wallet.GetWatchOnlyBalance();
+  primitives::Amount pending = 0;
+  for (const auto& utxo : wallet.TrackedUtxos()) {
+    if (utxo.state != wallet::UTXOState::kPending) {
+      continue;
+    }
+    // Only count outputs created by the pending transaction itself (e.g. change).
+    if (utxo.pending_txid == primitives::Hash256{} ||
+        utxo.outpoint.txid != utxo.pending_txid) {
+      continue;
+    }
+    primitives::Amount next = 0;
+    if (!primitives::CheckedAdd(pending, utxo.txout.value, &next)) {
+      pending = primitives::kMaxMoney;
+      break;
+    }
+    pending = next;
+  }
+  primitives::Amount total = 0;
+  primitives::Amount tmp = 0;
+  if (!primitives::CheckedAdd(spendable, pending, &tmp) ||
+      !primitives::CheckedAdd(tmp, watch_only, &total)) {
+    total = primitives::kMaxMoney;
+  }
   result["balance"] = FormatAmount(spendable);
-  result["pending"] = FormatAmount(0);
-  result["total"] = FormatAmount(spendable + watch_only);
+  result["pending"] = FormatAmount(pending);
+  result["total"] = FormatAmount(total);
   result["watch_only_balance"] = FormatAmount(watch_only);
   result["wallet_default_policy"] = AlgoToString(wallet.DefaultAlgorithm());
   result["locked"] = wallet.IsLocked();
@@ -1527,7 +1568,15 @@ nlohmann::json RpcServer::HandleListUtxos() const {
     entry["amount_miks"] = utxo.txout.value;
     entry["amount"] = FormatAmount(utxo.txout.value);
     entry["algo"] = AlgoToString(utxo.algorithm);
-    entry["spent"] = utxo.spent;
+    entry["state"] = UtxoStateToString(utxo.state);
+    entry["spent"] = utxo.state == wallet::UTXOState::kSpent;
+    if (utxo.state == wallet::UTXOState::kPending &&
+        utxo.pending_txid != primitives::Hash256{}) {
+      entry["pending_txid"] = HashToHex(utxo.pending_txid);
+    } else {
+      entry["pending_txid"] = nullptr;
+    }
+    entry["confirmed_height"] = utxo.confirmed_height;
     entry["is_change"] = utxo.is_change;
     entry["coinbase"] = utxo.coinbase;
     entry["watch_only"] = utxo.watch_only;
@@ -1687,6 +1736,32 @@ nlohmann::json RpcServer::HandlePurgeUtxos() {
   return result;
 }
 
+nlohmann::json RpcServer::HandleResyncWallet(const nlohmann::json& params) {
+  auto& wallet = WalletOrThrow();
+  std::size_t start_height = 0;
+  if (params.contains("start_height")) {
+    try {
+      const auto raw = params.at("start_height").get<std::int64_t>();
+      if (raw > 0) {
+        start_height = static_cast<std::size_t>(raw);
+      }
+    } catch (...) {
+      start_height = 0;
+    }
+  }
+
+  const std::size_t purged_count = wallet.PurgeUtxos();
+  wallet.Save();
+  RescanWallet(start_height, /*force_start_height=*/true);
+
+  nlohmann::json result;
+  result["purged_utxos"] = purged_count;
+  result["rescan_start_height"] = start_height;
+  result["status"] = "success";
+  result["message"] = "Wallet UTXO set rebuilt from chain state.";
+  return result;
+}
+
 nlohmann::json RpcServer::HandleSendToAddress(const nlohmann::json& params) {
   if (!params.contains("address") || !params.contains("amount")) {
     throw std::runtime_error("address and amount are required");
@@ -1739,6 +1814,25 @@ nlohmann::json RpcServer::HandleSendToAddress(const nlohmann::json& params) {
     }
     fee_rate = converted;
   }
+
+  // Proactively mark wallet UTXOs that no longer exist in the chain/mempool
+  // view as orphaned so coin selection does not produce missing-UTXO spends.
+  const std::size_t orphaned = wallet.MarkOrphanedUtxos([&](const primitives::COutPoint& outpoint) {
+    consensus::Coin coin;
+    if (chain_.GetCoin(outpoint, &coin)) {
+      return true;
+    }
+    std::lock_guard<std::mutex> lock(mempool_mutex_);
+    auto it_parent = mempool_by_txid_.find(outpoint.txid);
+    if (it_parent == mempool_by_txid_.end()) {
+      return false;
+    }
+    return outpoint.index < it_parent->second.tx.vout.size();
+  });
+  if (orphaned > 0) {
+    wallet.Save();
+  }
+
   std::vector<std::pair<std::string, primitives::Amount>> outputs = {{address, *amount}};
   std::string error;
   auto created = wallet.CreateTransaction(outputs, fee_rate, &error);
@@ -1869,6 +1963,21 @@ nlohmann::json RpcServer::HandleSendToPaymentCode(const nlohmann::json& params) 
   const auto address = crypto::EncodeP2QHAddress(derived.descriptor, cfg.bech32_hrp);
 
   auto& wallet = WalletOrThrow();
+  const std::size_t orphaned = wallet.MarkOrphanedUtxos([&](const primitives::COutPoint& outpoint) {
+    consensus::Coin coin;
+    if (chain_.GetCoin(outpoint, &coin)) {
+      return true;
+    }
+    std::lock_guard<std::mutex> lock(mempool_mutex_);
+    auto it_parent = mempool_by_txid_.find(outpoint.txid);
+    if (it_parent == mempool_by_txid_.end()) {
+      return false;
+    }
+    return outpoint.index < it_parent->second.tx.vout.size();
+  });
+  if (orphaned > 0) {
+    wallet.Save();
+  }
   std::vector<std::pair<std::string, primitives::Amount>> outputs = {{address, *amount}};
   std::string error;
   auto created = wallet.CreateTransactionWithWitnessPayload(
@@ -1973,6 +2082,22 @@ nlohmann::json RpcServer::HandleSendCommitment(const nlohmann::json& params) {
     fee_rate = converted;
   }
 
+  const std::size_t orphaned = wallet.MarkOrphanedUtxos([&](const primitives::COutPoint& outpoint) {
+    consensus::Coin coin;
+    if (chain_.GetCoin(outpoint, &coin)) {
+      return true;
+    }
+    std::lock_guard<std::mutex> lock(mempool_mutex_);
+    auto it_parent = mempool_by_txid_.find(outpoint.txid);
+    if (it_parent == mempool_by_txid_.end()) {
+      return false;
+    }
+    return outpoint.index < it_parent->second.tx.vout.size();
+  });
+  if (orphaned > 0) {
+    wallet.Save();
+  }
+
   const std::uint32_t tx_version = kTxCommitDelayFlag | delay_blocks;
   std::vector<std::pair<std::string, primitives::Amount>> outputs = {{address, *amount}};
   std::string error;
@@ -1981,6 +2106,7 @@ nlohmann::json RpcServer::HandleSendCommitment(const nlohmann::json& params) {
     throw std::runtime_error("tx creation failed: " + error);
   }
   const auto& tx = created->tx;
+  const auto txid = primitives::ComputeTxId(tx);
 
   std::vector<std::uint8_t> raw;
   primitives::serialize::SerializeTransaction(tx, &raw);
@@ -2014,6 +2140,18 @@ nlohmann::json RpcServer::HandleSendCommitment(const nlohmann::json& params) {
 
   const std::size_t broadcast_peers = BroadcastTransactionCommitment(commitment);
   if (require_broadcast && broadcast_peers == 0) {
+    wallet.RollbackPendingTransaction(txid);
+    wallet.Save();
+    {
+      std::lock_guard<std::mutex> lock(tx_commitment_mutex_);
+      auto it = tx_commitments_.find(commitment);
+      if (it != tx_commitments_.end() && it->second.locally_created && it->second.tx.has_value() &&
+          primitives::ComputeTxId(*it->second.tx) == txid) {
+        it->second.locally_created = false;
+        it->second.tx.reset();
+        it->second.revealed = false;
+      }
+    }
     throw std::runtime_error("commitment created but not broadcast to any peers: " +
                              HashToHex(commitment));
   }
@@ -2061,6 +2199,7 @@ nlohmann::json RpcServer::HandleRevealCommitment(const nlohmann::json& params) {
     throw std::runtime_error("no local transaction stored for this commitment_id");
   }
   const auto& tx = *entry.tx;
+  const auto txid = primitives::ComputeTxId(tx);
 
   const std::uint32_t delay_blocks = TxCommitDelayBlocks(tx);
   if (!TxRequiresCommitment(tx) || delay_blocks == 0 || delay_blocks > kMaxTxCommitDelayBlocks) {
@@ -2081,6 +2220,11 @@ nlohmann::json RpcServer::HandleRevealCommitment(const nlohmann::json& params) {
   if (!accepted) {
     if (reject_reason.empty()) {
       reject_reason = "rejected";
+    }
+    if (WalletLoaded()) {
+      auto& wallet = WalletOrThrow();
+      wallet.RollbackPendingTransaction(txid);
+      wallet.Save();
     }
     throw std::runtime_error("transaction rejected: " + reject_reason);
   }
@@ -4068,6 +4212,10 @@ void RpcServer::IndexWalletOutputs(const primitives::CBlock& block, bool save_wa
   }
   auto& wallet = WalletOrThrow();
   bool changed = false;
+  auto is_unspent = [&](const primitives::COutPoint& outpoint) {
+    consensus::Coin coin;
+    return chain_.GetCoin(outpoint, &coin);
+  };
   for (const auto& tx : block.transactions) {
     const bool is_coinbase = tx.IsCoinbase();
     auto txid = primitives::ComputeTxId(tx);
@@ -4076,11 +4224,17 @@ void RpcServer::IndexWalletOutputs(const primitives::CBlock& block, bool save_wa
       (void)chain_.GetTxFee(txid, &fee_miks);
     }
     for (std::size_t i = 0; i < tx.vout.size(); ++i) {
+      primitives::COutPoint outpoint;
+      outpoint.txid = txid;
+      outpoint.index = static_cast<std::uint32_t>(i);
+      if (!is_unspent(outpoint)) {
+        continue;
+      }
       if (wallet.MaybeTrackOutput(txid, i, tx.vout[i], is_coinbase, fee_miks)) {
         changed = true;
       }
     }
-    if (wallet.MaybeTrackStealthTransaction(txid, tx, is_coinbase, fee_miks)) {
+    if (wallet.MaybeTrackStealthTransaction(txid, tx, is_coinbase, fee_miks, is_unspent)) {
       changed = true;
     }
   }
@@ -4271,6 +4425,35 @@ void RpcServer::ProcessRelayRetryQueue(std::chrono::steady_clock::time_point now
     const auto delay = std::chrono::seconds(1ULL << exp);
     entry.next_attempt = now + delay;
   }
+}
+
+void RpcServer::QueueWalletRollback(const primitives::Hash256& txid) {
+  std::lock_guard<std::mutex> lock(wallet_event_mutex_);
+  wallet_rollback_queue_.push_back(txid);
+}
+
+void RpcServer::ProcessWalletRollbackQueue() {
+  if (!WalletLoaded()) {
+    return;
+  }
+
+  std::vector<primitives::Hash256> txids;
+  {
+    std::lock_guard<std::mutex> lock(wallet_event_mutex_);
+    if (wallet_rollback_queue_.empty()) {
+      return;
+    }
+    txids.swap(wallet_rollback_queue_);
+  }
+
+  std::sort(txids.begin(), txids.end());
+  txids.erase(std::unique(txids.begin(), txids.end()), txids.end());
+
+  auto& wallet = WalletOrThrow();
+  for (const auto& txid : txids) {
+    wallet.RollbackPendingTransaction(txid);
+  }
+  wallet.Save();
 }
 
 void RpcServer::RescanWallet(std::size_t start_height, bool force_start_height) {
@@ -4752,6 +4935,7 @@ void RpcServer::RemoveFromMempoolWithDescendantsLocked(const primitives::Hash256
 
   for (const auto& victim : queue) {
     RemoveFromMempoolLocked(victim);
+    QueueWalletRollback(victim);
   }
 }
 
@@ -5121,57 +5305,97 @@ void RpcServer::RemoveMinedTransactions(const primitives::CBlock& block,
   if (block.transactions.size() <= 1) {
     return;
   }
-  std::lock_guard<std::mutex> lock(mempool_mutex_);
-  if (mempool_by_txid_.empty()) {
-    return;
-  }
 
   std::vector<primitives::Hash256> mined;
   mined.reserve(block.transactions.size() - 1);
-  std::vector<primitives::Hash256> conflicts;
-  conflicts.reserve(block.transactions.size());
   for (std::size_t i = 1; i < block.transactions.size(); ++i) {
-    const auto& tx = block.transactions[i];
-    const auto txid = primitives::ComputeTxId(tx);
-    mined.push_back(txid);
-    // Evict any conflicting mempool transactions (and their descendants) that
-    // spend inputs already consumed by this block.
-    for (const auto& in : tx.vin) {
-      auto it = mempool_spends_.find(in.prevout);
-      if (it != mempool_spends_.end() && it->second != txid) {
-        conflicts.push_back(it->second);
+    mined.push_back(primitives::ComputeTxId(block.transactions[i]));
+  }
+
+  if (mined.empty()) {
+    return;
+  }
+
+  std::vector<primitives::Hash256> conflicts;
+  {
+    std::lock_guard<std::mutex> lock(mempool_mutex_);
+    if (!mempool_by_txid_.empty()) {
+      conflicts.reserve(block.transactions.size());
+      // Evict any conflicting mempool transactions (and their descendants) that
+      // spend inputs already consumed by this block.
+      for (std::size_t i = 1; i < block.transactions.size(); ++i) {
+        const auto& tx = block.transactions[i];
+        const auto txid = mined[i - 1];
+        for (const auto& in : tx.vin) {
+          auto it = mempool_spends_.find(in.prevout);
+          if (it != mempool_spends_.end() && it->second != txid) {
+            conflicts.push_back(it->second);
+          }
+        }
+      }
+
+      for (const auto& txid : mined) {
+        auto it = mempool_by_txid_.find(txid);
+        if (it == mempool_by_txid_.end()) {
+          continue;
+        }
+        const auto entry_height = it->second.entry_height;
+        const auto feerate = it->second.feerate_miks_per_vb;
+        if (height > entry_height) {
+          const std::uint32_t conf =
+              std::max<std::uint32_t>(1, height - entry_height);
+          fee_estimator_.AddConfirmation(feerate, conf);
+        }
+        RemoveFromMempoolLocked(txid);
+      }
+
+      if (!conflicts.empty()) {
+        std::sort(conflicts.begin(), conflicts.end());
+        conflicts.erase(std::unique(conflicts.begin(), conflicts.end()), conflicts.end());
+        for (const auto& txid : conflicts) {
+          RemoveFromMempoolWithDescendantsLocked(txid);
+        }
+      }
+
+      const double usage =
+          mempool_limit_bytes_ == 0
+              ? 0.0
+              : static_cast<double>(mempool_bytes_) / static_cast<double>(mempool_limit_bytes_);
+      if (usage < 0.25) {
+        MaybeDecayMempoolMinFeeLocked();
       }
     }
   }
 
-  for (const auto& txid : mined) {
-    auto it = mempool_by_txid_.find(txid);
-    if (it == mempool_by_txid_.end()) {
-      continue;
-    }
-    const auto entry_height = it->second.entry_height;
-    const auto feerate = it->second.feerate_miks_per_vb;
-    if (height > entry_height) {
-      const std::uint32_t conf =
-          std::max<std::uint32_t>(1, height - entry_height);
-      fee_estimator_.AddConfirmation(feerate, conf);
-    }
-    RemoveFromMempoolLocked(txid);
+  if (!WalletLoaded()) {
+    return;
+  }
+  auto& wallet = WalletOrThrow();
+  auto pending = wallet.PendingTransactionIds();
+  if (pending.empty()) {
+    return;
   }
 
-  if (!conflicts.empty()) {
-    std::sort(conflicts.begin(), conflicts.end());
-    conflicts.erase(std::unique(conflicts.begin(), conflicts.end()), conflicts.end());
-    for (const auto& txid : conflicts) {
-      RemoveFromMempoolWithDescendantsLocked(txid);
+  std::sort(mined.begin(), mined.end());
+  bool wallet_changed = false;
+  std::size_t i = 0;
+  std::size_t j = 0;
+  while (i < mined.size() && j < pending.size()) {
+    if (mined[i] < pending[j]) {
+      ++i;
+      continue;
     }
+    if (pending[j] < mined[i]) {
+      ++j;
+      continue;
+    }
+    wallet.ConfirmPendingTransaction(pending[j], height);
+    wallet_changed = true;
+    ++i;
+    ++j;
   }
-  const double usage =
-      mempool_limit_bytes_ == 0
-          ? 0.0
-          : static_cast<double>(mempool_bytes_) / static_cast<double>(mempool_limit_bytes_);
-  if (usage < 0.25) {
-    MaybeDecayMempoolMinFeeLocked();
+  if (wallet_changed) {
+    wallet.Save();
   }
 }
 

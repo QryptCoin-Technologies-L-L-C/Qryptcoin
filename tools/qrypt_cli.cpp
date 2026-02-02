@@ -256,6 +256,7 @@ void PrintUsage() {
             << "  removewatchonly <address...>\n"
             << "  listtransactions [count]\n"
             << "  purgeutxos                Clear stale UTXOs (requires rescan after)\n"
+            << "  resyncwallet [--start-height=N]  Purge + rescan wallet UTXOs\n"
             << "  getnetworkinfo\n"
             << "  getpeerinfo\n"
             << "  addnode <address[:port]> [--address=<address[:port]>]\n"
@@ -737,6 +738,10 @@ nlohmann::json BuildRequest(const CliOptions& opts) {
       throw std::runtime_error(command + " requires <commitment_id>");
     }
     params["commitment_id"] = opts.args[1];
+  } else if (command == "resyncwallet") {
+    if (auto start_opt = find_option("--start-height=")) {
+      params["start_height"] = std::stoull(*start_opt);
+    }
   } else if (command == "getwalletinfo" || command == "listaddresses" ||
              command == "listwatchonly" || command == "purgeutxos") {
     // no params

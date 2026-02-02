@@ -7,7 +7,9 @@
 #include "crypto/p2qh_address.hpp"
 #include "crypto/mnemonic.hpp"
 #include "crypto/hash.hpp"
+#include "primitives/txid.hpp"
 #include "script/p2qh.hpp"
+#include "util/hex.hpp"
 
 int main() {
   try {
@@ -36,14 +38,11 @@ int main() {
     primitives::CTxOut txout;
     txout.value = 5 * primitives::kMiksPerQRY;
     txout.locking_descriptor = *script_opt;
-    wallet::WalletUTXO utxo{outpoint,
-                            txout,
-                            wallet->KeyIndexForAddress(addr1).value(),
-                            crypto::SignatureAlgorithm::kDilithium,
-                            false,
-                            false,
-                            false,
-                            false};
+    wallet::WalletUTXO utxo;
+    utxo.outpoint = outpoint;
+    utxo.txout = txout;
+    utxo.key_index = wallet->KeyIndexForAddress(addr1).value();
+    utxo.algorithm = crypto::SignatureAlgorithm::kDilithium;
     wallet->AddUTXO(utxo);
     if (wallet->GetBalance() == 0) {
       std::cerr << "Balance not updated\n";
@@ -231,15 +230,11 @@ int main() {
       primitives::CTxOut txout_ext;
       txout_ext.value = 2 * primitives::kMiksPerQRY;
       txout_ext.locking_descriptor = *script_external;
-      wallet::WalletUTXO utxo_ext{
-          out_ext,
-          txout_ext,
-          send_wallet->KeyIndexForAddress(addr_external).value(),
-          crypto::SignatureAlgorithm::kDilithium,
-          false,
-          false,
-          false,
-          false};
+      wallet::WalletUTXO utxo_ext;
+      utxo_ext.outpoint = out_ext;
+      utxo_ext.txout = txout_ext;
+      utxo_ext.key_index = send_wallet->KeyIndexForAddress(addr_external).value();
+      utxo_ext.algorithm = crypto::SignatureAlgorithm::kDilithium;
       send_wallet->AddUTXO(utxo_ext);
 
       // UTXO B: tagged as wallet-internal change on addr_change (0.5 QRY).
@@ -249,15 +244,12 @@ int main() {
       primitives::CTxOut txout_chg;
       txout_chg.value = primitives::kMiksPerQRY / 2;  // 0.5 QRY
       txout_chg.locking_descriptor = *script_change;
-      wallet::WalletUTXO utxo_chg{
-          out_chg,
-          txout_chg,
-          send_wallet->KeyIndexForAddress(addr_change).value(),
-          crypto::SignatureAlgorithm::kDilithium,
-          false,
-          true,   // is_change
-          false,  // coinbase
-          false}; // watch_only
+      wallet::WalletUTXO utxo_chg;
+      utxo_chg.outpoint = out_chg;
+      utxo_chg.txout = txout_chg;
+      utxo_chg.key_index = send_wallet->KeyIndexForAddress(addr_change).value();
+      utxo_chg.algorithm = crypto::SignatureAlgorithm::kDilithium;
+      utxo_chg.is_change = true;
       send_wallet->AddUTXO(utxo_chg);
 
       // Spend 0.4 QRY; the wallet should preferentially consume the
@@ -315,15 +307,11 @@ int main() {
       primitives::CTxOut txout;
       txout.value = utxo_value;
       txout.locking_descriptor = *script;
-      wallet::WalletUTXO utxo{
-          out,
-          txout,
-          w->KeyIndexForAddress(addr).value(),
-          crypto::SignatureAlgorithm::kDilithium,
-          false,
-          false,
-          false,
-          false};
+      wallet::WalletUTXO utxo;
+      utxo.outpoint = out;
+      utxo.txout = txout;
+      utxo.key_index = w->KeyIndexForAddress(addr).value();
+      utxo.algorithm = crypto::SignatureAlgorithm::kDilithium;
       w->AddUTXO(utxo);
 
       std::vector<std::pair<std::string, primitives::Amount>> send_outputs = {
@@ -462,6 +450,182 @@ int main() {
       txid2.fill(0x43);
       if (watcher->MaybeTrackOutput(txid2, 0, txout, /*is_coinbase=*/false)) {
         std::cerr << "Output still tracked after removing watch-only address\n";
+        return EXIT_FAILURE;
+      }
+    }
+
+    // Pending lifecycle: CommitTransaction should mark inputs/change as pending,
+    // RollbackPendingTransaction should restore inputs and remove phantom change,
+    // and ConfirmPendingTransaction should finalize state transitions.
+    {
+      std::array<std::uint8_t, 32> seed{};
+      seed.fill(21);
+      auto w = wallet::HDWallet::FromSeedForTools(
+          seed, crypto::SignatureAlgorithm::kDilithium);
+      if (!w) {
+        std::cerr << "Failed to create in-memory wallet for pending-state test\n";
+        return EXIT_FAILURE;
+      }
+      const auto from_addr = w->NewAddress();
+      const auto dest_addr = w->NewAddress();
+      auto from_script = w->ScriptForAddress(from_addr);
+      if (!from_script) {
+        std::cerr << "Failed to derive script for pending-state test\n";
+        return EXIT_FAILURE;
+      }
+
+      primitives::COutPoint outpoint;
+      outpoint.txid.fill(0x99);
+      outpoint.index = 0;
+      primitives::CTxOut txout;
+      txout.value = 10 * primitives::kMiksPerQRY;
+      txout.locking_descriptor = *from_script;
+      wallet::WalletUTXO utxo;
+      utxo.outpoint = outpoint;
+      utxo.txout = txout;
+      utxo.key_index = w->KeyIndexForAddress(from_addr).value();
+      utxo.algorithm = crypto::SignatureAlgorithm::kDilithium;
+      w->AddUTXO(utxo);
+
+      std::vector<std::pair<std::string, primitives::Amount>> outputs = {
+          {dest_addr, primitives::kMiksPerQRY}};  // 1 QRY
+      std::string err;
+      auto created = w->CreateTransaction(outputs, /*fee_rate=*/1, &err);
+      if (!created) {
+        std::cerr << "CreateTransaction failed in pending-state test: " << err << "\n";
+        return EXIT_FAILURE;
+      }
+      std::string commit_err;
+      if (!w->CommitTransaction(*created, &commit_err)) {
+        std::cerr << "CommitTransaction failed in pending-state test: " << commit_err << "\n";
+        return EXIT_FAILURE;
+      }
+      const auto txid = primitives::ComputeTxId(created->tx);
+
+      const std::string txid_hex =
+          util::HexEncode(std::span<const std::uint8_t>(txid.data(), txid.size()));
+      bool saw_send_event = false;
+      for (const auto& tx : w->ListTransactions()) {
+        if (!tx.incoming && tx.txid == txid_hex) {
+          saw_send_event = true;
+          break;
+        }
+      }
+      if (!saw_send_event) {
+        std::cerr << "Missing send transaction entry after CommitTransaction\n";
+        return EXIT_FAILURE;
+      }
+
+      bool saw_pending_input = false;
+      bool saw_pending_change = false;
+      for (const auto& tracked : w->TrackedUtxos()) {
+        if (tracked.outpoint.txid == outpoint.txid &&
+            tracked.outpoint.index == outpoint.index) {
+          saw_pending_input = true;
+          if (tracked.state != wallet::UTXOState::kPending ||
+              tracked.pending_txid != txid) {
+            std::cerr << "Input UTXO not marked pending after CommitTransaction\n";
+            return EXIT_FAILURE;
+          }
+        }
+        if (tracked.outpoint.txid == txid &&
+            tracked.state == wallet::UTXOState::kPending &&
+            tracked.pending_txid == txid) {
+          saw_pending_change = true;
+        }
+      }
+      if (!saw_pending_input) {
+        std::cerr << "Input UTXO missing after CommitTransaction\n";
+        return EXIT_FAILURE;
+      }
+      if (!saw_pending_change) {
+        std::cerr << "Expected pending change UTXO after CommitTransaction\n";
+        return EXIT_FAILURE;
+      }
+
+      // Pending inputs and pending change outputs should not be selectable for
+      // new spends.
+      std::string err2;
+      auto retry = w->CreateTransaction(outputs, /*fee_rate=*/1, &err2);
+      if (retry) {
+        std::cerr << "Unexpectedly created tx while funds were pending\n";
+        return EXIT_FAILURE;
+      }
+      if (err2 != "insufficient funds") {
+        std::cerr << "Unexpected error while funds pending: " << err2 << "\n";
+        return EXIT_FAILURE;
+      }
+
+      w->RollbackPendingTransaction(txid);
+
+      bool saw_available_input = false;
+      bool saw_phantom_change = false;
+      for (const auto& tracked : w->TrackedUtxos()) {
+        if (tracked.outpoint.txid == outpoint.txid &&
+            tracked.outpoint.index == outpoint.index) {
+          saw_available_input = true;
+          if (tracked.state != wallet::UTXOState::kAvailable) {
+            std::cerr << "Input UTXO not restored to available after rollback\n";
+            return EXIT_FAILURE;
+          }
+        }
+        if (tracked.outpoint.txid == txid) {
+          saw_phantom_change = true;
+        }
+      }
+      if (!saw_available_input) {
+        std::cerr << "Input UTXO missing after rollback\n";
+        return EXIT_FAILURE;
+      }
+      if (saw_phantom_change) {
+        std::cerr << "Phantom change UTXO retained after rollback\n";
+        return EXIT_FAILURE;
+      }
+
+      for (const auto& tx : w->ListTransactions()) {
+        if (!tx.incoming && tx.txid == txid_hex) {
+          std::cerr << "Send transaction entry was not removed on rollback\n";
+          return EXIT_FAILURE;
+        }
+      }
+
+      // Commit again and then confirm it.
+      created = w->CreateTransaction(outputs, /*fee_rate=*/1, &err);
+      if (!created) {
+        std::cerr << "CreateTransaction failed after rollback: " << err << "\n";
+        return EXIT_FAILURE;
+      }
+      if (!w->CommitTransaction(*created, &commit_err)) {
+        std::cerr << "CommitTransaction failed after rollback: " << commit_err << "\n";
+        return EXIT_FAILURE;
+      }
+      const auto txid2 = primitives::ComputeTxId(created->tx);
+      constexpr std::uint32_t kConfirmHeight = 123;
+      w->ConfirmPendingTransaction(txid2, kConfirmHeight);
+
+      bool saw_spent_input = false;
+      bool saw_confirmed_change = false;
+      for (const auto& tracked : w->TrackedUtxos()) {
+        if (tracked.outpoint.txid == outpoint.txid &&
+            tracked.outpoint.index == outpoint.index) {
+          saw_spent_input = true;
+          if (tracked.state != wallet::UTXOState::kSpent) {
+            std::cerr << "Input UTXO not marked spent on confirmation\n";
+            return EXIT_FAILURE;
+          }
+        }
+        if (tracked.outpoint.txid == txid2 &&
+            tracked.state == wallet::UTXOState::kAvailable &&
+            tracked.confirmed_height == kConfirmHeight) {
+          saw_confirmed_change = true;
+        }
+      }
+      if (!saw_spent_input) {
+        std::cerr << "Spent input UTXO missing after confirmation\n";
+        return EXIT_FAILURE;
+      }
+      if (!saw_confirmed_change) {
+        std::cerr << "Confirmed change UTXO missing after confirmation\n";
         return EXIT_FAILURE;
       }
     }

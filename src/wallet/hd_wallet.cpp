@@ -37,7 +37,7 @@ namespace qryptcoin::wallet {
 namespace {
 
 constexpr std::uint32_t kWalletMagic = 0x51574C54;  // 'QTLT'
-constexpr std::uint16_t kWalletVersion = 7;
+constexpr std::uint16_t kWalletVersion = 8;
 constexpr std::uint16_t kMinWalletVersion = 6;
 constexpr std::size_t kSha3_256BlockSize = 136;
 constexpr std::uint32_t kPbkdf2Iterations = 200000;
@@ -475,7 +475,7 @@ void HDWallet::EnsureKeypoolGap(std::uint32_t gap_limit) {
   std::unordered_map<std::uint32_t, bool> used_indices;
   used_indices.reserve(utxos_.size());
   for (const auto& utxo : utxos_) {
-    if (!utxo.spent) {
+    if (utxo.state != UTXOState::kSpent && utxo.state != UTXOState::kOrphaned) {
       used_indices[utxo.key_index] = true;
     }
   }
@@ -984,12 +984,36 @@ primitives::Amount HDWallet::GetBalance() const {
     primitives::COutPoint outpoint;
     bool initialized{false};
   };
+  std::unordered_set<std::uint32_t> locked_keys;
+  locked_keys.reserve(utxos_.size());
+  for (const auto& utxo : utxos_) {
+    if (utxo.state != UTXOState::kPending) {
+      continue;
+    }
+    if (utxo.pending_txid == primitives::Hash256{}) {
+      continue;
+    }
+    // Only treat keys as locked when we are spending an existing UTXO.
+    if (utxo.pending_txid == utxo.outpoint.txid) {
+      continue;
+    }
+    if (utxo.watch_only) {
+      continue;
+    }
+    if (utxo.key_index == kStealthKeyIndex) {
+      continue;
+    }
+    locked_keys.insert(utxo.key_index);
+  }
   std::unordered_map<std::uint32_t, BestCandidate> best_by_key;
   best_by_key.reserve(utxos_.size());
   std::unordered_map<std::array<std::uint8_t, 32>, BestCandidate, SeedHasher> best_by_stealth;
   best_by_stealth.reserve(utxos_.size());
   for (const auto& utxo : utxos_) {
-    if (utxo.spent || utxo.watch_only) {
+    if (utxo.state != UTXOState::kAvailable || utxo.watch_only) {
+      continue;
+    }
+    if (utxo.key_index != kStealthKeyIndex && locked_keys.contains(utxo.key_index)) {
       continue;
     }
     if (utxo.txout.value == 0) {
@@ -1050,7 +1074,7 @@ primitives::Amount HDWallet::GetBalance() const {
 primitives::Amount HDWallet::GetWatchOnlyBalance() const {
   primitives::Amount total = 0;
   for (const auto& utxo : utxos_) {
-    if (!utxo.spent && utxo.watch_only) {
+    if (utxo.state == UTXOState::kAvailable && utxo.watch_only) {
       primitives::Amount next = 0;
       if (!primitives::CheckedAdd(total, utxo.txout.value, &next)) {
         return primitives::kMaxMoney;
@@ -1083,6 +1107,9 @@ bool HDWallet::AddUTXO(const WalletUTXO& utxo, bool is_coinbase,
   }
   if (is_new) {
     WalletUTXO stored = utxo;
+    stored.state = UTXOState::kAvailable;
+    stored.pending_txid = {};
+    stored.confirmed_height = 0;
     stored.coinbase = is_coinbase;
     utxos_.push_back(stored);
   }
@@ -1143,7 +1170,8 @@ bool HDWallet::MaybeTrackOutput(const primitives::Hash256& txid, std::size_t vou
 bool HDWallet::MaybeTrackStealthTransaction(const primitives::Hash256& txid,
                                             const primitives::CTransaction& tx,
                                             bool is_coinbase,
-                                            primitives::Amount tx_fee_miks) {
+                                            primitives::Amount tx_fee_miks,
+                                            std::function<bool(const primitives::COutPoint&)> is_unspent) {
   if (is_coinbase || tx.vin.empty() || tx.vout.empty()) {
     return false;
   }
@@ -1201,6 +1229,9 @@ bool HDWallet::MaybeTrackStealthTransaction(const primitives::Hash256& txid,
       utxo.key_index = kStealthKeyIndex;
       utxo.algorithm = crypto::SignatureAlgorithm::kDilithium;
       utxo.watch_only = false;
+      if (is_unspent && !is_unspent(utxo.outpoint)) {
+        continue;
+      }
       const bool is_new = AddUTXO(utxo, is_coinbase, tx_fee_miks);
       stealth_spend_seeds_[utxo.outpoint] = derived.key_seed;
       changed = changed || is_new;
@@ -1411,13 +1442,36 @@ std::optional<CreatedTransaction> HDWallet::CreateTransactionInternal(
 
   std::vector<Candidate> candidates;
   candidates.reserve(utxos_.size());
+  std::unordered_set<std::uint32_t> locked_keys;
+  locked_keys.reserve(utxos_.size());
+  for (const auto& utxo : utxos_) {
+    if (utxo.state != UTXOState::kPending) {
+      continue;
+    }
+    if (utxo.pending_txid == primitives::Hash256{}) {
+      continue;
+    }
+    if (utxo.pending_txid == utxo.outpoint.txid) {
+      continue;
+    }
+    if (utxo.watch_only) {
+      continue;
+    }
+    if (utxo.key_index == kStealthKeyIndex) {
+      continue;
+    }
+    locked_keys.insert(utxo.key_index);
+  }
   std::unordered_map<std::uint32_t, Candidate> best_by_key;
   best_by_key.reserve(utxos_.size());
   std::unordered_map<std::array<std::uint8_t, 32>, Candidate, SeedHasher> best_by_stealth;
   best_by_stealth.reserve(utxos_.size());
   for (std::size_t i = 0; i < utxos_.size(); ++i) {
     const auto& utxo = utxos_[i];
-    if (utxo.spent || utxo.watch_only || utxo.txout.value == 0) {
+    if (utxo.state != UTXOState::kAvailable || utxo.watch_only || utxo.txout.value == 0) {
+      continue;
+    }
+    if (utxo.key_index != kStealthKeyIndex && locked_keys.contains(utxo.key_index)) {
       continue;
     }
     Candidate candidate{i, utxo.txout.value, utxo.is_change, utxo.coinbase};
@@ -1643,7 +1697,9 @@ std::optional<CreatedTransaction> HDWallet::CreateTransactionInternal(
     change_utxo.txout = tx.vout.back();
     change_utxo.key_index = next_index_ - 1;
     change_utxo.algorithm = default_algorithm_;
-    change_utxo.spent = false;
+    change_utxo.state = UTXOState::kPending;
+    change_utxo.pending_txid = change_outpoint.txid;
+    change_utxo.confirmed_height = 0;
     change_utxo.is_change = true;
     change_utxo.coinbase = false;
     created.change_utxo = change_utxo;
@@ -1659,35 +1715,43 @@ bool HDWallet::CommitTransaction(const CreatedTransaction& created, std::string*
     return false;
   }
 
-  for (const auto& outpoint : created.spent_outpoints) {
-    bool found = false;
+  const auto txid = primitives::ComputeTxId(created.tx);
+
+  auto find_utxo = [&](const primitives::COutPoint& outpoint) -> WalletUTXO* {
     for (auto& utxo : utxos_) {
       if (utxo.outpoint.txid == outpoint.txid && utxo.outpoint.index == outpoint.index) {
-        utxo.spent = true;
-        if (!utxo.watch_only) {
-          if (utxo.key_index == kStealthKeyIndex) {
-            stealth_spend_seeds_.erase(utxo.outpoint);
-          } else {
-            BurnKeyIndex(utxo.key_index);
-          }
-        }
-        found = true;
-        break;
+        return &utxo;
       }
     }
-    if (!found) {
+    return nullptr;
+  };
+
+  for (const auto& outpoint : created.spent_outpoints) {
+    auto* utxo = find_utxo(outpoint);
+    if (!utxo) {
       if (error) *error = "missing utxo for spend";
       return false;
     }
+    if (utxo->state != UTXOState::kAvailable) {
+      if (error) *error = "utxo not available for spend";
+      return false;
+    }
+    utxo->state = UTXOState::kPending;
+    utxo->pending_txid = txid;
+    utxo->confirmed_height = 0;
   }
 
   if (created.change_utxo.has_value()) {
-    const auto& utxo = *created.change_utxo;
+    auto utxo = *created.change_utxo;
+    utxo.state = UTXOState::kPending;
+    utxo.pending_txid = txid;
+    utxo.confirmed_height = 0;
     bool exists = false;
-    for (const auto& existing : utxos_) {
+    for (auto& existing : utxos_) {
       if (existing.outpoint.txid == utxo.outpoint.txid &&
           existing.outpoint.index == utxo.outpoint.index) {
         exists = true;
+        existing = utxo;
         break;
       }
     }
@@ -1697,7 +1761,6 @@ bool HDWallet::CommitTransaction(const CreatedTransaction& created, std::string*
   }
 
   WalletTransaction event;
-  const auto txid = primitives::ComputeTxId(created.tx);
   event.txid = util::HexEncode(std::span<const std::uint8_t>(txid.data(), txid.size()));
   event.amount = created.sent_total;
   event.incoming = false;
@@ -1709,6 +1772,109 @@ bool HDWallet::CommitTransaction(const CreatedTransaction& created, std::string*
   RecordTransaction(event);
 
   return true;
+}
+
+void HDWallet::ConfirmPendingTransaction(const primitives::Hash256& txid,
+                                         std::uint32_t confirmed_height) {
+  for (auto& utxo : utxos_) {
+    if (utxo.state != UTXOState::kPending) {
+      continue;
+    }
+    if (utxo.pending_txid != txid) {
+      continue;
+    }
+
+    // Outputs created by the transaction itself (change/self-send) become
+    // spendable once the transaction is confirmed.
+    if (utxo.outpoint.txid == txid) {
+      utxo.state = UTXOState::kAvailable;
+      utxo.pending_txid = {};
+      utxo.confirmed_height = confirmed_height;
+      continue;
+    }
+
+    // Inputs spent by the transaction are now permanently spent.
+    utxo.state = UTXOState::kSpent;
+    utxo.pending_txid = {};
+    utxo.confirmed_height = confirmed_height;
+
+    if (!utxo.watch_only) {
+      if (utxo.key_index == kStealthKeyIndex) {
+        stealth_spend_seeds_.erase(utxo.outpoint);
+      } else {
+        BurnKeyIndex(utxo.key_index);
+      }
+    }
+  }
+}
+
+void HDWallet::RollbackPendingTransaction(const primitives::Hash256& txid) {
+  utxos_.erase(std::remove_if(utxos_.begin(), utxos_.end(),
+                             [&](WalletUTXO& utxo) {
+                               if (utxo.state != UTXOState::kPending) {
+                                 return false;
+                               }
+                               if (utxo.pending_txid != txid) {
+                                 return false;
+                               }
+                               // Outputs created by this transaction never
+                               // confirmed; remove them to avoid phantom UTXOs.
+                               if (utxo.outpoint.txid == txid) {
+                                 return true;
+                               }
+                               // Restore inputs to spendable state.
+                               utxo.state = UTXOState::kAvailable;
+                               utxo.pending_txid = {};
+                               utxo.confirmed_height = 0;
+                               return false;
+                             }),
+              utxos_.end());
+
+  const std::string txid_hex =
+      util::HexEncode(std::span<const std::uint8_t>(txid.data(), txid.size()));
+  transactions_.erase(std::remove_if(transactions_.begin(), transactions_.end(),
+                                     [&](const WalletTransaction& entry) {
+                                       return !entry.incoming && entry.txid == txid_hex;
+                                     }),
+                      transactions_.end());
+}
+
+std::vector<primitives::Hash256> HDWallet::PendingTransactionIds() const {
+  std::vector<primitives::Hash256> ids;
+  ids.reserve(utxos_.size());
+  for (const auto& utxo : utxos_) {
+    if (utxo.state != UTXOState::kPending) {
+      continue;
+    }
+    if (utxo.pending_txid == primitives::Hash256{}) {
+      continue;
+    }
+    ids.push_back(utxo.pending_txid);
+  }
+  std::sort(ids.begin(), ids.end());
+  ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+  return ids;
+}
+
+std::size_t HDWallet::MarkOrphanedUtxos(
+    const std::function<bool(const primitives::COutPoint&)>& view_has_utxo) {
+  if (!view_has_utxo) {
+    return 0;
+  }
+  std::size_t orphaned = 0;
+  for (auto& utxo : utxos_) {
+    if (utxo.state != UTXOState::kAvailable) {
+      continue;
+    }
+    if (view_has_utxo(utxo.outpoint)) {
+      continue;
+    }
+    utxo.state = UTXOState::kOrphaned;
+    utxo.pending_txid = {};
+    utxo.confirmed_height = 0;
+    ++orphaned;
+  }
+  return orphaned;
 }
 
 bool HDWallet::Save() const {
@@ -1861,7 +2027,7 @@ std::vector<std::uint8_t> HDWallet::SerializeState() const {
                   utxo.txout.locking_descriptor.end());
     primitives::serialize::WriteUint32(&buffer, utxo.key_index);
     buffer.push_back(crypto::EncodeSignatureAlgorithm(utxo.algorithm));
-    buffer.push_back(static_cast<std::uint8_t>(utxo.spent));
+    buffer.push_back(static_cast<std::uint8_t>(utxo.state == UTXOState::kSpent));
     buffer.push_back(static_cast<std::uint8_t>(utxo.watch_only));
   }
   // Persist the set of watch-only addresses as a simple list of
@@ -1902,6 +2068,18 @@ std::vector<std::uint8_t> HDWallet::SerializeState() const {
     if (utxo.coinbase) utxo_flags |= 0x01;
     if (utxo.is_change) utxo_flags |= 0x02;
     buffer.push_back(utxo_flags);
+  }
+  // Persist UTXO lifecycle state (available/pending/spent/orphaned) and any
+  // pending transaction linkage in a tagged trailer so older wallet binaries
+  // can ignore it safely.
+  buffer.push_back(0x06);  // utxo state tag v1
+  write_varint(utxos_.size());
+  for (const auto& utxo : utxos_) {
+    buffer.insert(buffer.end(), utxo.outpoint.txid.begin(), utxo.outpoint.txid.end());
+    primitives::serialize::WriteUint32(&buffer, utxo.outpoint.index);
+    buffer.push_back(static_cast<std::uint8_t>(utxo.state));
+    buffer.insert(buffer.end(), utxo.pending_txid.begin(), utxo.pending_txid.end());
+    primitives::serialize::WriteUint32(&buffer, utxo.confirmed_height);
   }
   if (!burned_key_indices_.empty()) {
     buffer.push_back(0x03);  // burned key indices tag v1
@@ -2082,7 +2260,8 @@ bool HDWallet::DeserializeState(const std::vector<std::uint8_t>& payload, std::u
     } catch (const std::exception&) {
       return fail("wallet payload contains invalid utxo signature policy id");
     }
-    utxo.spent = payload[offset++] != 0;
+    const bool spent = payload[offset++] != 0;
+    utxo.state = spent ? UTXOState::kSpent : UTXOState::kAvailable;
     if (version >= 3) {
       utxo.watch_only = payload[offset++] != 0;
     } else {
@@ -2142,6 +2321,24 @@ bool HDWallet::DeserializeState(const std::vector<std::uint8_t>& payload, std::u
         break;
       }
     }
+  };
+
+  auto apply_utxo_state = [&](const primitives::COutPoint& outpoint,
+                              std::uint8_t raw_state,
+                              const primitives::Hash256& pending_txid,
+                              std::uint32_t confirmed_height) -> bool {
+    if (raw_state > static_cast<std::uint8_t>(UTXOState::kOrphaned)) {
+      return false;
+    }
+    for (auto& utxo : utxos_) {
+      if (utxo.outpoint.txid == outpoint.txid && utxo.outpoint.index == outpoint.index) {
+        utxo.state = static_cast<UTXOState>(raw_state);
+        utxo.pending_txid = pending_txid;
+        utxo.confirmed_height = confirmed_height;
+        return true;
+      }
+    }
+    return true;
   };
 
   while (offset < payload.size()) {
@@ -2212,6 +2409,49 @@ bool HDWallet::DeserializeState(const std::vector<std::uint8_t>& payload, std::u
       auto dup = std::adjacent_find(burned_key_indices_.begin(), burned_key_indices_.end());
       if (dup != burned_key_indices_.end()) {
         return fail("wallet payload contains duplicate burned key indices");
+      }
+      continue;
+    }
+    if (tag == 0x06) {
+      std::uint64_t count = 0;
+      if (!read_varint(&count)) {
+        return fail("wallet payload invalid varint (utxo state count)");
+      }
+      constexpr std::size_t kEntryBytes = 32 + 4 + 1 + 32 + 4;
+      if (count > (payload.size() - offset) / kEntryBytes) {
+        return fail("wallet payload truncated (utxo state entries)");
+      }
+      for (std::uint64_t i = 0; i < count; ++i) {
+        primitives::COutPoint outpoint;
+        if (offset + outpoint.txid.size() > payload.size()) {
+          return fail("wallet payload truncated (utxo state txid)");
+        }
+        std::copy(payload.begin() + offset,
+                  payload.begin() + offset + outpoint.txid.size(),
+                  outpoint.txid.begin());
+        offset += outpoint.txid.size();
+        if (!primitives::serialize::ReadUint32(payload, &offset, &outpoint.index)) {
+          return fail("wallet payload truncated (utxo state index)");
+        }
+        if (offset >= payload.size()) {
+          return fail("wallet payload truncated (utxo state byte)");
+        }
+        const std::uint8_t raw_state = payload[offset++];
+        if (offset + primitives::Hash256{}.size() > payload.size()) {
+          return fail("wallet payload truncated (utxo pending txid)");
+        }
+        primitives::Hash256 pending_txid{};
+        std::copy(payload.begin() + offset,
+                  payload.begin() + offset + pending_txid.size(),
+                  pending_txid.begin());
+        offset += pending_txid.size();
+        std::uint32_t confirmed_height = 0;
+        if (!primitives::serialize::ReadUint32(payload, &offset, &confirmed_height)) {
+          return fail("wallet payload truncated (utxo confirmed height)");
+        }
+        if (!apply_utxo_state(outpoint, raw_state, pending_txid, confirmed_height)) {
+          return fail("wallet payload contains invalid utxo state byte");
+        }
       }
       continue;
     }
@@ -2315,7 +2555,7 @@ bool HDWallet::DeserializeState(const std::vector<std::uint8_t>& payload, std::u
     std::unordered_set<std::uint32_t> burned;
     burned.reserve(utxos_.size());
     for (const auto& utxo : utxos_) {
-      if (utxo.spent && !utxo.watch_only) {
+      if (utxo.state == UTXOState::kSpent && !utxo.watch_only) {
         burned.insert(utxo.key_index);
       }
     }

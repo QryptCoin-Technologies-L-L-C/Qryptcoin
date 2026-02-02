@@ -88,6 +88,7 @@ class RpcServer {
   nlohmann::json HandleListAddresses() const;
   nlohmann::json HandleForgetAddresses(const nlohmann::json& params);
   nlohmann::json HandlePurgeUtxos();
+  nlohmann::json HandleResyncWallet(const nlohmann::json& params);
   nlohmann::json HandleImportAddress(const nlohmann::json& params);
   nlohmann::json HandleListWatchOnly() const;
   nlohmann::json HandleRemoveWatchOnly(const nlohmann::json& params);
@@ -136,6 +137,8 @@ class RpcServer {
                                              std::uint64_t exclude_peer_id = 0);
   void QueueTransactionRelayRetry(const primitives::Hash256& txid);
   void ProcessRelayRetryQueue(std::chrono::steady_clock::time_point now);
+  void QueueWalletRollback(const primitives::Hash256& txid);
+  void ProcessWalletRollbackQueue();
 
   struct Hash256Hasher {
     std::size_t operator()(const primitives::Hash256& hash) const noexcept {
@@ -211,6 +214,9 @@ class RpcServer {
   void RebroadcastMempool();
   bool LoadMempoolFromDisk(std::string* error);
   bool SaveMempoolToDisk(std::string* error);
+
+  std::mutex wallet_event_mutex_;
+  std::vector<primitives::Hash256> wallet_rollback_queue_;
 
  public:
   // Test-only helper to exercise mempool logic without going through

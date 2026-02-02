@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -29,12 +30,21 @@ struct WalletTransaction {
   bool coinbase{false};
 };
 
+enum class UTXOState : std::uint8_t {
+  kAvailable = 0,
+  kPending = 1,
+  kSpent = 2,
+  kOrphaned = 3,
+};
+
 struct WalletUTXO {
   primitives::COutPoint outpoint;
   primitives::CTxOut txout;
   std::uint32_t key_index{0};
   crypto::SignatureAlgorithm algorithm{crypto::SignatureAlgorithm::kDilithium};
-  bool spent{false};
+  UTXOState state{UTXOState::kAvailable};
+  primitives::Hash256 pending_txid{};
+  std::uint32_t confirmed_height{0};
   bool is_change{false};
   bool coinbase{false};
   // Outputs tracked as watch-only belong to scripts that the wallet
@@ -156,7 +166,8 @@ class HDWallet {
   bool MaybeTrackStealthTransaction(const primitives::Hash256& txid,
                                     const primitives::CTransaction& tx,
                                     bool is_coinbase,
-                                    primitives::Amount tx_fee_miks = 0);
+                                    primitives::Amount tx_fee_miks = 0,
+                                    std::function<bool(const primitives::COutPoint&)> is_unspent = {});
   std::optional<CreatedTransaction> CreateTransaction(
       const std::vector<std::pair<std::string, primitives::Amount>>& outputs,
       primitives::Amount fee_rate, std::string* error);
@@ -171,6 +182,12 @@ class HDWallet {
       std::span<const std::uint8_t> witness_payload,
       std::string* error);
   bool CommitTransaction(const CreatedTransaction& tx, std::string* error = nullptr);
+  void ConfirmPendingTransaction(const primitives::Hash256& txid,
+                                 std::uint32_t confirmed_height = 0);
+  void RollbackPendingTransaction(const primitives::Hash256& txid);
+  std::vector<primitives::Hash256> PendingTransactionIds() const;
+  std::size_t MarkOrphanedUtxos(
+      const std::function<bool(const primitives::COutPoint&)>& view_has_utxo);
   bool Save() const;
   std::string ExportSeedHex() const;
   const std::vector<WalletUTXO>& TrackedUtxos() const { return utxos_; }
