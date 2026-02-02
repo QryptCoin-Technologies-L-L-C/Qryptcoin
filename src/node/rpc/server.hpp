@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -71,10 +72,16 @@ class RpcServer {
   nlohmann::json HandleWaitForBlock(const nlohmann::json& params) const;
   nlohmann::json HandleGetRawTransaction(const nlohmann::json& params) const;
   nlohmann::json HandleGetNewAddress(const nlohmann::json& params);
-  nlohmann::json HandleGetPaymentCode() const;
+  nlohmann::json HandleGetPaymentCode(const nlohmann::json& params) const;
   nlohmann::json HandleValidatePaymentCode(const nlohmann::json& params) const;
   nlohmann::json HandleResolvePaymentCode(const nlohmann::json& params);
+  nlohmann::json HandleRegisterPaymentCode(const nlohmann::json& params);
+  nlohmann::json HandleResolvePaymentCodeShort(const nlohmann::json& params) const;
   nlohmann::json HandleSendToAddress(const nlohmann::json& params);
+  nlohmann::json HandleSendToPaymentCode(const nlohmann::json& params);
+  nlohmann::json HandleSendCommitment(const nlohmann::json& params);
+  nlohmann::json HandleRevealCommitment(const nlohmann::json& params);
+  nlohmann::json HandleGetCommitmentStatus(const nlohmann::json& params) const;
   nlohmann::json HandleGetWalletInfo() const;
   nlohmann::json HandleListTransactions(const nlohmann::json& params) const;
   nlohmann::json HandleListUtxos() const;
@@ -125,6 +132,8 @@ class RpcServer {
   void IndexWalletOutputs(const primitives::CBlock& block, bool save_wallet = true);
   void AnnounceBlock(const primitives::Hash256& hash);
   std::size_t BroadcastTransaction(const primitives::CTransaction& tx);
+  std::size_t BroadcastTransactionCommitment(const primitives::Hash256& commitment,
+                                             std::uint64_t exclude_peer_id = 0);
   void QueueTransactionRelayRetry(const primitives::Hash256& txid);
   void ProcessRelayRetryQueue(std::chrono::steady_clock::time_point now);
 
@@ -177,6 +186,16 @@ class RpcServer {
     }
   };
 
+  struct Array16Hasher {
+    std::size_t operator()(const std::array<std::uint8_t, 16>& value) const noexcept {
+      std::size_t result = 0;
+      for (auto byte : value) {
+        result = (result * 131) ^ static_cast<std::size_t>(byte);
+      }
+      return result;
+    }
+  };
+
   bool AddToMempool(const primitives::CTransaction& tx,
                     std::optional<double> feerate_miks_per_vb_override,
                     std::string* reject_reason = nullptr,
@@ -212,6 +231,8 @@ class RpcServer {
                                   std::vector<std::uint8_t>* out) const;
   bool SubmitTransactionFromNetwork(const primitives::CTransaction& tx,
                                     std::string* reject_reason = nullptr);
+  void NotifyTransactionCommitmentFromNetwork(const primitives::Hash256& commitment,
+                                              std::uint64_t peer_id);
   void NotifyBlockConnected(const primitives::CBlock& block, std::uint32_t height);
 
   std::unique_ptr<wallet::HDWallet> wallet_;
@@ -261,6 +282,20 @@ class RpcServer {
   std::atomic<std::uint64_t> relay_broadcast_zero_peer_total_{0};
   std::atomic<std::uint64_t> relay_broadcast_retry_scheduled_total_{0};
   std::atomic<std::uint64_t> relay_broadcast_retry_success_total_{0};
+
+  struct TxCommitmentEntry {
+    std::uint32_t first_seen_height{0};
+    std::uint64_t first_seen_time{0};
+    bool locally_created{false};
+    bool revealed{false};
+    std::optional<primitives::CTransaction> tx;
+  };
+  mutable std::mutex tx_commitment_mutex_;
+  std::unordered_map<primitives::Hash256, TxCommitmentEntry, Hash256Hasher> tx_commitments_;
+
+  mutable std::mutex paycode_registry_mutex_;
+  std::unordered_map<std::array<std::uint8_t, 16>, std::string, Array16Hasher>
+      paycode_v2_registry_;
 
   // Simple tracking of peers added via addnode so operators can
   // inspect them with getaddednodeinfo.

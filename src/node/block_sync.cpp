@@ -316,6 +316,11 @@ void BlockSyncManager::SetTransactionHandler(TransactionHandler handler) {
   on_transaction_received_ = std::move(handler);
 }
 
+void BlockSyncManager::SetTxCommitmentHandler(TxCommitmentHandler handler) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  on_tx_commitment_received_ = std::move(handler);
+}
+
 void BlockSyncManager::SetTransactionInventoryPolicy(HasTransactionFn has_tx,
                                                      GetTransactionBytesFn get_tx_bytes) {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -488,6 +493,7 @@ void BlockSyncManager::PeerLoop(std::stop_token stop, net::PeerManager::PeerInfo
         }
         break;
       case Command::kTransaction:
+      case Command::kTxCommitment:
         if (tx_limit > 0 && ++tx_count > tx_limit) {
           std::cerr << "[sync] peer " << info.id << " exceeded TX rate limit\n";
           peers_.AddBanScore(info.id, 10);
@@ -564,6 +570,10 @@ void BlockSyncManager::DispatchMessage(const net::PeerManager::PeerInfo& info,
     }
     case Command::kTransaction: {
       HandleTransaction(info, message);
+      break;
+    }
+    case Command::kTxCommitment: {
+      HandleTxCommitment(info, message);
       break;
     }
     case Command::kPong:
@@ -1275,6 +1285,27 @@ void BlockSyncManager::HandleTransaction(const net::PeerManager::PeerInfo& info,
     recent_rejects_[txid] = RecentRejectEntry{std::chrono::steady_clock::now() + kRecentRejectsTtl,
                                               reject_reason};
   }
+}
+
+void BlockSyncManager::HandleTxCommitment(const net::PeerManager::PeerInfo& info,
+                                          const net::messages::Message& message) {
+  TxCommitmentHandler handler_copy;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    handler_copy = on_tx_commitment_received_;
+  }
+  if (!handler_copy) {
+    return;
+  }
+  net::messages::TxCommitmentMessage commit{};
+  if (!net::messages::DecodeTxCommitment(message, &commit)) {
+    std::cerr << "[sync] peer " << info.id << " sent malformed TX_COMMITMENT payload\n";
+    peers_.AddBanScore(info.id, 5);
+    return;
+  }
+  primitives::Hash256 commitment{};
+  std::copy(commit.commitment.begin(), commit.commitment.end(), commitment.begin());
+  handler_copy(commitment, info.id);
 }
 
 void BlockSyncManager::SendGetHeaders(const net::PeerManager::PeerInfo& info,

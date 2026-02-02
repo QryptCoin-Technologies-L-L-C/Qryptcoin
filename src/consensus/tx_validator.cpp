@@ -165,9 +165,12 @@ bool ValidateTransaction(const primitives::CTransaction& tx, const UTXOSet& view
     }
     script::ScriptPubKey script_pubkey{coin->out.locking_descriptor};
     const auto sighash = ComputeSighash(tx, input_index, *coin);
+    const auto sig_message = ComputeP2QHSignatureMessage(
+        sighash, std::span<const primitives::WitnessStackItem>(
+                     input.witness_stack.data(), input.witness_stack.size()));
     if (!script::VerifyP2QHWitness(
             script_pubkey, input.witness_stack,
-            std::span<const std::uint8_t>(sighash.data(), sighash.size()), error)) {
+            std::span<const std::uint8_t>(sig_message.data(), sig_message.size()), error)) {
       return false;
     }
   }

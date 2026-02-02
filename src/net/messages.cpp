@@ -416,4 +416,19 @@ bool DecodeHandshakeFinished(const Message& msg, HandshakeFinished* out) {
   return true;
 }
 
+Message EncodeTxCommitment(const TxCommitmentMessage& msg) {
+  Message message{Command::kTxCommitment, {}};
+  message.payload.assign(msg.commitment.begin(), msg.commitment.end());
+  return message;
+}
+
+bool DecodeTxCommitment(const Message& msg, TxCommitmentMessage* out) {
+  if (msg.command != Command::kTxCommitment) return false;
+  if (msg.payload.size() != crypto::Sha3_256Hash{}.size()) {
+    return false;
+  }
+  std::copy_n(msg.payload.begin(), out->commitment.size(), out->commitment.begin());
+  return true;
+}
+
 }  // namespace qryptcoin::net::messages

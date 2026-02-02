@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(qryptcoin-node VERSION 0.1.0 LANGUAGES C CXX)
+project(qryptcoin-node VERSION 1.0.0 LANGUAGES C CXX)
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
   message(FATAL_ERROR "In-source builds are not supported. Run CMake with -B <build_dir>.")
@@ -106,6 +106,7 @@ set(QRY_CORE_SOURCES
   src/consensus/pow.cpp
   src/consensus/revealed_pubkeys.cpp
   src/consensus/sighash.cpp
+  src/consensus/sparse_merkle_tree.cpp
   src/consensus/tx_validator.cpp
   src/consensus/utxo.cpp
   src/consensus/versionbits.cpp
@@ -115,6 +116,7 @@ set(QRY_CORE_SOURCES
   src/crypto/bech32.cpp
   src/crypto/mnemonic.cpp
   src/crypto/payment_code.cpp
+  src/crypto/payment_code_short.cpp
   src/crypto/crypto_suite.cpp
   src/crypto/deterministic_rng.cpp
   src/crypto/dilithium_randombytes.cpp
@@ -122,6 +124,7 @@ set(QRY_CORE_SOURCES
   src/crypto/p2qh_address.cpp
   src/crypto/p2qh_descriptor.cpp
   src/crypto/pq_engine.cpp
+  src/crypto/stealth_address.cpp
 
   src/tx/primitives/merkle.cpp
   src/tx/primitives/serialize.cpp

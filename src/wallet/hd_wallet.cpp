@@ -16,6 +16,8 @@
 #include "crypto/deterministic_rng.hpp"
 #include "crypto/hash.hpp"
 #include "crypto/payment_code.hpp"
+#include "crypto/payment_code_short.hpp"
+#include "crypto/stealth_address.hpp"
 #include "crypto/p2qh_address.hpp"
 #include "crypto/p2qh_descriptor.hpp"
 #include "crypto/mnemonic.hpp"
@@ -49,6 +51,7 @@ constexpr std::uint32_t kDefaultKeypoolGap = 20;
 // branch-and-bound style coin selection. This keeps the exponential
 // search space bounded while still handling common operator cases.
 constexpr std::size_t kMaxBranchAndBoundInputs = 12;
+constexpr std::uint32_t kStealthKeyIndex = std::numeric_limits<std::uint32_t>::max();
 
 // Argon2id parameter caps when loading wallet files (DoS hardening).
 constexpr std::uint32_t kMaxWalletArgon2idT = 10;
@@ -67,6 +70,16 @@ std::size_t VarIntSize(std::uint64_t value) {
   if (value <= 0xFFFFFFFFu) return 5;
   return 9;
 }
+
+struct SeedHasher {
+  std::size_t operator()(const std::array<std::uint8_t, 32>& seed) const noexcept {
+    std::size_t result = 0;
+    for (auto byte : seed) {
+      result = (result * 131) ^ static_cast<std::size_t>(byte);
+    }
+    return result;
+  }
+};
 
 std::size_t EstimateRevealBytes(crypto::SignatureAlgorithm algo) {
   // P2QH reveal payload is encoded as:
@@ -88,7 +101,8 @@ std::size_t EstimateWitnessBytesPerInput(crypto::SignatureAlgorithm algo) {
 
 std::uint64_t EstimateTransactionVBytes(std::uint64_t inputs,
                                        std::uint64_t outputs,
-                                       crypto::SignatureAlgorithm algo) {
+                                       crypto::SignatureAlgorithm algo,
+                                       std::uint64_t extra_witness_bytes = 0) {
   if (inputs == 0 || outputs == 0) {
     return 0;
   }
@@ -102,7 +116,8 @@ std::uint64_t EstimateTransactionVBytes(std::uint64_t inputs,
       output_bytes +
       kBaseTxLockTimeBytes;
   const std::uint64_t witness_bytes =
-      2 + inputs * static_cast<std::uint64_t>(EstimateWitnessBytesPerInput(algo));
+      2 + inputs * static_cast<std::uint64_t>(EstimateWitnessBytesPerInput(algo)) +
+      extra_witness_bytes;
   const std::uint64_t weight = base_bytes * 4ULL + witness_bytes;
   return (weight + 3ULL) / 4ULL;
 }
@@ -748,6 +763,71 @@ std::string HDWallet::PaymentCode() const {
   return crypto::EncodePaymentCodeV1(code, cfg.bech32_hrp);
 }
 
+const crypto::QPqKyberKEM& HDWallet::PaymentCodeV2Kem() const {
+  if (paycode_v2_kem_.has_value()) {
+    return *paycode_v2_kem_;
+  }
+
+  const auto& cfg = config::GetNetworkConfig();
+  std::vector<std::uint8_t> preimage;
+  constexpr std::string_view kTag = "QRY-PAYCODE-KYBER-KEYGEN-V2";
+  preimage.reserve(kTag.size() + cfg.message_start.size() + seed_.size());
+  preimage.insert(preimage.end(), kTag.begin(), kTag.end());
+  preimage.insert(preimage.end(), cfg.message_start.begin(), cfg.message_start.end());
+  preimage.insert(preimage.end(), seed_.begin(), seed_.end());
+  const auto drbg_seed = crypto::Sha3_256(preimage);
+
+  crypto::DeterministicOqsRng rng(
+      std::span<const std::uint8_t>(drbg_seed.data(), drbg_seed.size()),
+      crypto::DeterministicOqsRng::Mode::kShake256Xof);
+  paycode_v2_kem_.emplace(crypto::QPqKyberKEM::GenerateDeterministic());
+  return *paycode_v2_kem_;
+}
+
+crypto::PaymentCodeV2 HDWallet::BuildPaymentCodeV2() const {
+  const auto& cfg = config::GetNetworkConfig();
+  auto network_id_from_magic = [](const std::array<std::uint8_t, 4>& magic) -> std::uint32_t {
+    return static_cast<std::uint32_t>(magic[0]) |
+           (static_cast<std::uint32_t>(magic[1]) << 8) |
+           (static_cast<std::uint32_t>(magic[2]) << 16) |
+           (static_cast<std::uint32_t>(magic[3]) << 24);
+  };
+
+  auto tagged_seed_hash = [&](std::string_view tag) -> crypto::Sha3_256Hash {
+    std::vector<std::uint8_t> preimage;
+    preimage.reserve(tag.size() + cfg.message_start.size() + seed_.size());
+    for (char c : tag) {
+      preimage.push_back(static_cast<std::uint8_t>(c));
+    }
+    preimage.insert(preimage.end(), cfg.message_start.begin(), cfg.message_start.end());
+    preimage.insert(preimage.end(), seed_.begin(), seed_.end());
+    return crypto::Sha3_256(preimage);
+  };
+
+  crypto::PaymentCodeV2 code{};
+  code.network_id = network_id_from_magic(cfg.message_start);
+  const auto spend = tagged_seed_hash("QRY-PAYCODE-SPENDROOT-V2");
+  std::copy(spend.begin(), spend.end(), code.spend_root_commitment.begin());
+  const auto& kem = PaymentCodeV2Kem();
+  const auto kem_pk = kem.PublicKey();
+  if (kem_pk.size() != code.scan_pubkey.size()) {
+    throw std::runtime_error("PaymentCodeV2 Kyber public key size mismatch");
+  }
+  std::copy(kem_pk.begin(), kem_pk.end(), code.scan_pubkey.begin());
+  return code;
+}
+
+std::string HDWallet::PaymentCodeV2() const {
+  const auto& cfg = config::GetNetworkConfig();
+  return crypto::EncodePaymentCodeV2(BuildPaymentCodeV2(), cfg.bech32_hrp);
+}
+
+std::string HDWallet::PaymentCodeV2ShortId() const {
+  const auto& cfg = config::GetNetworkConfig();
+  const auto short_id = crypto::PaymentCodeShortId::FromPaymentCodeV2(BuildPaymentCodeV2());
+  return crypto::EncodePaymentCodeShortId(short_id, cfg.bech32_hrp);
+}
+
 std::vector<std::string> HDWallet::ListAddresses() const {
   std::vector<std::string> result;
   for (const auto& addr : addresses_) {
@@ -768,6 +848,7 @@ std::vector<std::string> HDWallet::ListWatchOnlyAddresses() const {
 std::size_t HDWallet::PurgeUtxos() {
   const std::size_t count = utxos_.size();
   utxos_.clear();
+  stealth_spend_seeds_.clear();
   transactions_.clear();
   return count;
 }
@@ -905,11 +986,27 @@ primitives::Amount HDWallet::GetBalance() const {
   };
   std::unordered_map<std::uint32_t, BestCandidate> best_by_key;
   best_by_key.reserve(utxos_.size());
+  std::unordered_map<std::array<std::uint8_t, 32>, BestCandidate, SeedHasher> best_by_stealth;
+  best_by_stealth.reserve(utxos_.size());
   for (const auto& utxo : utxos_) {
     if (utxo.spent || utxo.watch_only) {
       continue;
     }
     if (utxo.txout.value == 0) {
+      continue;
+    }
+    if (utxo.key_index == kStealthKeyIndex) {
+      auto it = stealth_spend_seeds_.find(utxo.outpoint);
+      if (it == stealth_spend_seeds_.end()) {
+        continue;
+      }
+      auto& best = best_by_stealth[it->second];
+      if (!best.initialized || utxo.txout.value > best.value ||
+          (utxo.txout.value == best.value && outpoint_less(utxo.outpoint, best.outpoint))) {
+        best.value = utxo.txout.value;
+        best.outpoint = utxo.outpoint;
+        best.initialized = true;
+      }
       continue;
     }
     if (IsKeyBurned(utxo.key_index)) {
@@ -926,6 +1023,17 @@ primitives::Amount HDWallet::GetBalance() const {
 
   primitives::Amount total = 0;
   for (const auto& kv : best_by_key) {
+    const auto& best = kv.second;
+    if (!best.initialized) {
+      continue;
+    }
+    primitives::Amount next = 0;
+    if (!primitives::CheckedAdd(total, best.value, &next)) {
+      return primitives::kMaxMoney;
+    }
+    total = next;
+  }
+  for (const auto& kv : best_by_stealth) {
     const auto& best = kv.second;
     if (!best.initialized) {
       continue;
@@ -1032,6 +1140,76 @@ bool HDWallet::MaybeTrackOutput(const primitives::Hash256& txid, std::size_t vou
   return AddUTXO(utxo, is_coinbase, tx_fee_miks);
 }
 
+bool HDWallet::MaybeTrackStealthTransaction(const primitives::Hash256& txid,
+                                            const primitives::CTransaction& tx,
+                                            bool is_coinbase,
+                                            primitives::Amount tx_fee_miks) {
+  if (is_coinbase || tx.vin.empty() || tx.vout.empty()) {
+    return false;
+  }
+
+  crypto::PaymentCodeV2 paycode = BuildPaymentCodeV2();
+  const auto& kem = PaymentCodeV2Kem();
+
+  bool changed = false;
+  for (const auto& in : tx.vin) {
+    if (in.witness_stack.size() < 3) {
+      continue;
+    }
+    std::span<const std::uint8_t> ciphertext;
+    for (std::size_t i = 2; i < in.witness_stack.size(); ++i) {
+      const auto& item = in.witness_stack[i].data;
+      if (item.size() == crypto::kMlkem768CiphertextBytes) {
+        ciphertext = std::span<const std::uint8_t>(item.data(), item.size());
+        break;
+      }
+    }
+    if (ciphertext.empty()) {
+      continue;
+    }
+
+    std::vector<std::uint8_t> shared_secret;
+    try {
+      shared_secret = kem.Decapsulate(ciphertext);
+    } catch (...) {
+      continue;
+    }
+
+    crypto::StealthDerivationV1 derived{};
+    std::string derive_error;
+    if (!crypto::DeriveStealthOutputV1(
+            std::span<const std::uint8_t>(shared_secret.data(), shared_secret.size()),
+            paycode, ciphertext, &derived, &derive_error)) {
+      continue;
+    }
+
+    for (std::size_t vout_index = 0; vout_index < tx.vout.size(); ++vout_index) {
+      const auto& txout = tx.vout[vout_index];
+      script::ScriptPubKey script{txout.locking_descriptor};
+      std::array<std::uint8_t, script::kP2QHWitnessProgramSize> program{};
+      if (!script::ExtractWitnessProgram(script, &program)) {
+        continue;
+      }
+      if (!std::equal(program.begin(), program.end(), derived.descriptor.program.begin())) {
+        continue;
+      }
+
+      WalletUTXO utxo;
+      utxo.outpoint.txid = txid;
+      utxo.outpoint.index = static_cast<std::uint32_t>(vout_index);
+      utxo.txout = txout;
+      utxo.key_index = kStealthKeyIndex;
+      utxo.algorithm = crypto::SignatureAlgorithm::kDilithium;
+      utxo.watch_only = false;
+      const bool is_new = AddUTXO(utxo, is_coinbase, tx_fee_miks);
+      stealth_spend_seeds_[utxo.outpoint] = derived.key_seed;
+      changed = changed || is_new;
+    }
+  }
+
+  return changed;
+}
+
 HDWallet::KeyMaterial HDWallet::DeriveKeyMaterial(std::uint32_t index,
                                                   crypto::SignatureAlgorithm /*algorithm*/) const {
   KeyMaterial material;
@@ -1048,6 +1226,19 @@ HDWallet::KeyMaterial HDWallet::DeriveKeyMaterial(std::uint32_t index,
 
   const auto dil_span = material.dilithium->PublicKey();
   material.reveal = crypto::BuildP2QHReveal(dil_span);
+  material.descriptor = crypto::DescriptorFromReveal(material.reveal);
+  return material;
+}
+
+HDWallet::KeyMaterial HDWallet::DeriveStealthKeyMaterial(
+    const std::array<std::uint8_t, 32>& key_seed) const {
+  KeyMaterial material;
+  material.algorithm = crypto::SignatureAlgorithm::kDilithium;
+  crypto::DeterministicOqsRng rng(
+      std::span<const std::uint8_t>(key_seed.data(), key_seed.size()),
+      crypto::DeterministicOqsRng::Mode::kShake256Xof);
+  material.dilithium.emplace(crypto::QPqDilithiumKey::Generate());
+  material.reveal = crypto::BuildP2QHReveal(material.dilithium->PublicKey());
   material.descriptor = crypto::DescriptorFromReveal(material.reveal);
   return material;
 }
@@ -1115,6 +1306,33 @@ std::uint64_t HDWallet::Now() const {
 std::optional<CreatedTransaction> HDWallet::CreateTransaction(
     const std::vector<std::pair<std::string, primitives::Amount>>& outputs,
     primitives::Amount fee_rate, std::string* error) {
+  return CreateTransactionInternal(outputs, fee_rate, /*tx_version=*/1,
+                                   std::span<const std::uint8_t>(), error);
+}
+
+std::optional<CreatedTransaction> HDWallet::CreateTransactionWithVersion(
+    const std::vector<std::pair<std::string, primitives::Amount>>& outputs,
+    primitives::Amount fee_rate,
+    std::uint32_t tx_version,
+    std::string* error) {
+  return CreateTransactionInternal(outputs, fee_rate, tx_version, std::span<const std::uint8_t>(),
+                                   error);
+}
+
+std::optional<CreatedTransaction> HDWallet::CreateTransactionWithWitnessPayload(
+    const std::vector<std::pair<std::string, primitives::Amount>>& outputs,
+    primitives::Amount fee_rate,
+    std::span<const std::uint8_t> witness_payload,
+    std::string* error) {
+  return CreateTransactionInternal(outputs, fee_rate, /*tx_version=*/1, witness_payload, error);
+}
+
+std::optional<CreatedTransaction> HDWallet::CreateTransactionInternal(
+    const std::vector<std::pair<std::string, primitives::Amount>>& outputs,
+    primitives::Amount fee_rate,
+    std::uint32_t tx_version,
+    std::span<const std::uint8_t> witness_payload,
+    std::string* error) {
   if (locked_) {
     if (error) *error = "wallet is locked";
     return std::nullopt;
@@ -1156,8 +1374,14 @@ std::optional<CreatedTransaction> HDWallet::CreateTransaction(
   auto need_more = [&]() -> bool {
     const std::uint64_t estimate_inputs = static_cast<std::uint64_t>(selected.size()) + 1;
     const std::uint64_t estimate_outputs = static_cast<std::uint64_t>(targets.size()) + 1;
+    const std::uint64_t extra_witness_bytes =
+        witness_payload.empty()
+            ? 0ULL
+            : static_cast<std::uint64_t>(VarIntSize(witness_payload.size()) +
+                                         witness_payload.size());
     const std::uint64_t estimated_vbytes =
-        EstimateTransactionVBytes(estimate_inputs, estimate_outputs, default_algorithm_);
+        EstimateTransactionVBytes(estimate_inputs, estimate_outputs, default_algorithm_,
+                                  extra_witness_bytes);
     if (estimated_vbytes == 0) {
       return false;
     }
@@ -1189,15 +1413,35 @@ std::optional<CreatedTransaction> HDWallet::CreateTransaction(
   candidates.reserve(utxos_.size());
   std::unordered_map<std::uint32_t, Candidate> best_by_key;
   best_by_key.reserve(utxos_.size());
+  std::unordered_map<std::array<std::uint8_t, 32>, Candidate, SeedHasher> best_by_stealth;
+  best_by_stealth.reserve(utxos_.size());
   for (std::size_t i = 0; i < utxos_.size(); ++i) {
     const auto& utxo = utxos_[i];
     if (utxo.spent || utxo.watch_only || utxo.txout.value == 0) {
       continue;
     }
+    Candidate candidate{i, utxo.txout.value, utxo.is_change, utxo.coinbase};
+    if (utxo.key_index == kStealthKeyIndex) {
+      auto it_seed = stealth_spend_seeds_.find(utxo.outpoint);
+      if (it_seed == stealth_spend_seeds_.end()) {
+        continue;
+      }
+      auto it = best_by_stealth.find(it_seed->second);
+      if (it == best_by_stealth.end()) {
+        best_by_stealth.emplace(it_seed->second, candidate);
+        continue;
+      }
+      const auto& best = it->second;
+      if (candidate.value > best.value ||
+          (candidate.value == best.value && candidate.index < best.index)) {
+        it->second = candidate;
+      }
+      continue;
+    }
+
     if (IsKeyBurned(utxo.key_index)) {
       continue;
     }
-    Candidate candidate{i, utxo.txout.value, utxo.is_change, utxo.coinbase};
     const auto key_index = utxo.key_index;
     auto it = best_by_key.find(key_index);
     if (it == best_by_key.end()) {
@@ -1211,6 +1455,9 @@ std::optional<CreatedTransaction> HDWallet::CreateTransaction(
     }
   }
   for (const auto& kv : best_by_key) {
+    candidates.push_back(kv.second);
+  }
+  for (const auto& kv : best_by_stealth) {
     candidates.push_back(kv.second);
   }
 
@@ -1314,7 +1561,7 @@ std::optional<CreatedTransaction> HDWallet::CreateTransaction(
   }
 
   primitives::CTransaction tx;
-  tx.version = 1;
+  tx.version = tx_version;
   for (auto index : selected) {
     primitives::CTxIn in;
     in.prevout = utxos_[index].outpoint;
@@ -1343,15 +1590,34 @@ std::optional<CreatedTransaction> HDWallet::CreateTransaction(
     consensus::Coin coin;
     coin.out = utxo.txout;
     auto sighash = consensus::ComputeSighash(tx, idx, coin);
-    auto material = DeriveKeyMaterial(utxo.key_index, crypto::SignatureAlgorithm::kDilithium);
+    KeyMaterial material;
+    if (utxo.key_index == kStealthKeyIndex) {
+      auto it = stealth_spend_seeds_.find(utxo.outpoint);
+      if (it == stealth_spend_seeds_.end()) {
+        if (error) *error = "missing stealth spend seed";
+        return std::nullopt;
+      }
+      material = DeriveStealthKeyMaterial(it->second);
+    } else {
+      material = DeriveKeyMaterial(utxo.key_index, crypto::SignatureAlgorithm::kDilithium);
+    }
     std::vector<primitives::WitnessStackItem> witness_items;
     witness_items.push_back(primitives::WitnessStackItem{material.reveal});
-    const auto msg_span = std::span<const std::uint8_t>(sighash.data(), sighash.size());
+    witness_items.push_back(primitives::WitnessStackItem{});  // placeholder signature
+    if (!witness_payload.empty() && idx == 0) {
+      witness_items.push_back(primitives::WitnessStackItem{
+          std::vector<std::uint8_t>(witness_payload.begin(), witness_payload.end())});
+    }
+    const auto sig_message = consensus::ComputeP2QHSignatureMessage(
+        sighash, std::span<const primitives::WitnessStackItem>(
+                     witness_items.data(), witness_items.size()));
+    const auto msg_span =
+        std::span<const std::uint8_t>(sig_message.data(), sig_message.size());
     if (!material.dilithium.has_value()) {
       if (error) *error = "missing Dilithium key material";
       return std::nullopt;
     }
-    witness_items.push_back(primitives::WitnessStackItem{material.dilithium->Sign(msg_span)});
+    witness_items[1].data = material.dilithium->Sign(msg_span);
     tx.vin[idx].witness_stack = std::move(witness_items);
   }
 
@@ -1399,7 +1665,11 @@ bool HDWallet::CommitTransaction(const CreatedTransaction& created, std::string*
       if (utxo.outpoint.txid == outpoint.txid && utxo.outpoint.index == outpoint.index) {
         utxo.spent = true;
         if (!utxo.watch_only) {
-          BurnKeyIndex(utxo.key_index);
+          if (utxo.key_index == kStealthKeyIndex) {
+            stealth_spend_seeds_.erase(utxo.outpoint);
+          } else {
+            BurnKeyIndex(utxo.key_index);
+          }
         }
         found = true;
         break;
@@ -1510,7 +1780,7 @@ bool HDWallet::LoadFromFile(const std::string& path, const std::string& password
 
   util::SecureWipe(password_);
   util::SecureWipe(seed_);
-  *this = *loaded;
+  *this = std::move(*loaded);
   last_error_.clear();
   return true;
 }
@@ -1650,6 +1920,30 @@ std::vector<std::uint8_t> HDWallet::SerializeState() const {
       primitives::serialize::WriteUint32(&buffer, reservation.expiry_height);
       buffer.insert(buffer.end(), reservation.challenge.begin(), reservation.challenge.end());
       buffer.push_back(static_cast<std::uint8_t>(reservation.status));
+    }
+  }
+  if (!stealth_spend_seeds_.empty()) {
+    buffer.push_back(0x05);  // stealth spend seeds tag v1
+    std::vector<std::pair<primitives::COutPoint, std::array<std::uint8_t, 32>>> ordered;
+    ordered.reserve(stealth_spend_seeds_.size());
+    for (const auto& kv : stealth_spend_seeds_) {
+      ordered.push_back(kv);
+    }
+    std::sort(ordered.begin(), ordered.end(),
+              [](const auto& a, const auto& b) {
+                if (a.first.txid != b.first.txid) {
+                  return std::lexicographical_compare(a.first.txid.begin(), a.first.txid.end(),
+                                                      b.first.txid.begin(), b.first.txid.end());
+                }
+                return a.first.index < b.first.index;
+              });
+    write_varint(ordered.size());
+    for (const auto& kv : ordered) {
+      const auto& outpoint = kv.first;
+      const auto& seed = kv.second;
+      buffer.insert(buffer.end(), outpoint.txid.begin(), outpoint.txid.end());
+      primitives::serialize::WriteUint32(&buffer, outpoint.index);
+      buffer.insert(buffer.end(), seed.begin(), seed.end());
     }
   }
   return buffer;
@@ -1837,6 +2131,7 @@ bool HDWallet::DeserializeState(const std::vector<std::uint8_t>& payload, std::u
   last_scan_height_.reset();
   burned_key_indices_.clear();
   payment_code_reservations_.clear();
+  stealth_spend_seeds_.clear();
 
   auto apply_utxo_flags = [&](const primitives::COutPoint& outpoint,
                               std::uint8_t flags) {
@@ -1960,6 +2255,55 @@ bool HDWallet::DeserializeState(const std::vector<std::uint8_t>& payload, std::u
         }
         r.status = static_cast<PaymentCodeReservationStatus>(status);
         payment_code_reservations_.push_back(r);
+      }
+      continue;
+    }
+    if (tag == 0x05) {
+      std::uint64_t count = 0;
+      if (!read_varint(&count)) {
+        return fail("wallet payload invalid varint (stealth spend seeds count)");
+      }
+      constexpr std::size_t kEntryBytes = 32 + 4 + 32;
+      if (count > (payload.size() - offset) / kEntryBytes) {
+        return fail("wallet payload truncated (stealth spend seeds)");
+      }
+
+      std::unordered_set<primitives::COutPoint, consensus::OutPointHasher> known_stealth;
+      known_stealth.reserve(utxos_.size());
+      for (const auto& utxo : utxos_) {
+        if (utxo.key_index == kStealthKeyIndex && !utxo.watch_only) {
+          known_stealth.insert(utxo.outpoint);
+        }
+      }
+
+      stealth_spend_seeds_.reserve(static_cast<std::size_t>(count));
+      for (std::uint64_t i = 0; i < count; ++i) {
+        primitives::COutPoint outpoint;
+        if (offset + outpoint.txid.size() > payload.size()) {
+          return fail("wallet payload truncated (stealth spend seed txid)");
+        }
+        std::copy(payload.begin() + offset,
+                  payload.begin() + offset + outpoint.txid.size(),
+                  outpoint.txid.begin());
+        offset += outpoint.txid.size();
+        if (!primitives::serialize::ReadUint32(payload, &offset, &outpoint.index)) {
+          return fail("wallet payload truncated (stealth spend seed index)");
+        }
+        if (offset + 32 > payload.size()) {
+          return fail("wallet payload truncated (stealth spend seed bytes)");
+        }
+        std::array<std::uint8_t, 32> key_seed{};
+        std::copy(payload.begin() + offset,
+                  payload.begin() + offset + key_seed.size(),
+                  key_seed.begin());
+        offset += key_seed.size();
+
+        if (!known_stealth.contains(outpoint)) {
+          return fail("wallet payload contains stealth spend seed for unknown utxo");
+        }
+        if (!stealth_spend_seeds_.emplace(outpoint, key_seed).second) {
+          return fail("wallet payload contains duplicate stealth spend seed outpoint");
+        }
       }
       continue;
     }

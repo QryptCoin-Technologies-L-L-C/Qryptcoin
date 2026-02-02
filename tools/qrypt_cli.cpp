@@ -33,6 +33,7 @@
 #include "config/network.hpp"
 #include "crypto/p2qh_address.hpp"
 #include "crypto/payment_code.hpp"
+#include "crypto/payment_code_short.hpp"
 #include "net/socket.hpp"
 #include "nlohmann/json.hpp"
 #include "util/csprng.hpp"
@@ -235,7 +236,13 @@ void PrintUsage() {
             << "  getpaymentcode\n"
             << "  validatepaymentcode <code>\n"
             << "  resolvepaymentcode <code>\n"
+            << "  registerpaymentcode <paycode_v2>\n"
+            << "  resolvepaymentcodeshort <short_id>\n"
             << "  sendtoaddress <address> <amount> [--fee-rate=N]\n"
+            << "  sendtopaymentcode <code> <amount> [--fee-rate=N]\n"
+            << "  sendcommitment <address> <amount> [--fee-rate=N] [--delay-blocks=N]\n"
+            << "  revealcommitment <commitment_id>\n"
+            << "  getcommitmentstatus <commitment_id>\n"
             << "  sendto <paycode-or-address> <amount> [--fee-rate=N] [--resolver=<host:port>]\n"
             << "       [--resolver-policy=local-only|lan-ok|insecure-ok]\n"
             << "       [--allow-lan-resolver] [--allow-insecure-resolver]\n"
@@ -680,6 +687,16 @@ nlohmann::json BuildRequest(const CliOptions& opts) {
       throw std::runtime_error(command + " requires <code>");
     }
     params["payment_code"] = opts.args[1];
+  } else if (command == "registerpaymentcode") {
+    if (opts.args.size() < 2) {
+      throw std::runtime_error("registerpaymentcode requires <paycode_v2>");
+    }
+    params["payment_code_v2"] = opts.args[1];
+  } else if (command == "resolvepaymentcodeshort") {
+    if (opts.args.size() < 2) {
+      throw std::runtime_error("resolvepaymentcodeshort requires <short_id>");
+    }
+    params["short_id"] = opts.args[1];
   } else if (command == "sendtoaddress") {
     if (opts.args.size() < 3) {
       throw std::runtime_error("sendtoaddress requires <address> <amount>");
@@ -691,6 +708,35 @@ nlohmann::json BuildRequest(const CliOptions& opts) {
         params["fee_rate"] = std::stoull(opts.args[i].substr(11));
       }
     }
+  } else if (command == "sendtopaymentcode") {
+    if (opts.args.size() < 3) {
+      throw std::runtime_error("sendtopaymentcode requires <code> <amount>");
+    }
+    params["payment_code"] = opts.args[1];
+    params["amount"] = opts.args[2];
+    for (std::size_t i = 3; i < opts.args.size(); ++i) {
+      if (opts.args[i].rfind("--fee-rate=", 0) == 0) {
+        params["fee_rate"] = std::stoull(opts.args[i].substr(11));
+      }
+    }
+  } else if (command == "sendcommitment") {
+    if (opts.args.size() < 3) {
+      throw std::runtime_error("sendcommitment requires <address> <amount>");
+    }
+    params["address"] = opts.args[1];
+    params["amount"] = opts.args[2];
+    for (std::size_t i = 3; i < opts.args.size(); ++i) {
+      if (opts.args[i].rfind("--fee-rate=", 0) == 0) {
+        params["fee_rate"] = std::stoull(opts.args[i].substr(11));
+      } else if (opts.args[i].rfind("--delay-blocks=", 0) == 0) {
+        params["delay_blocks"] = std::stoull(opts.args[i].substr(14));
+      }
+    }
+  } else if (command == "revealcommitment" || command == "getcommitmentstatus") {
+    if (opts.args.size() < 2) {
+      throw std::runtime_error(command + " requires <commitment_id>");
+    }
+    params["commitment_id"] = opts.args[1];
   } else if (command == "getwalletinfo" || command == "listaddresses" ||
              command == "listwatchonly" || command == "purgeutxos") {
     // no params
@@ -914,15 +960,43 @@ nlohmann::json HandleSendTo(const CliOptions& opts) {
   const auto resolver_opt = FindPrefixedOptionValue(opts.args, "--resolver=");
   const auto& cfg = qryptcoin::config::GetNetworkConfig();
 
-  qryptcoin::crypto::PaymentCodeV1 paycode{};
-  std::string paycode_error;
-  const bool is_paycode =
-      qryptcoin::crypto::DecodePaymentCodeV1(destination, cfg.bech32_hrp, &paycode, &paycode_error);
+  qryptcoin::crypto::PaymentCodeV2 paycode_v2{};
+  std::string paycode_v2_error;
+  const bool is_paycode_v2 =
+      qryptcoin::crypto::DecodePaymentCodeV2(destination, cfg.bech32_hrp, &paycode_v2,
+                                             &paycode_v2_error);
+
+  if (is_paycode_v2) {
+    nlohmann::json send_params = {{"payment_code", destination}, {"amount", amount}};
+    if (fee_rate.has_value()) {
+      send_params["fee_rate"] = *fee_rate;
+    }
+    nlohmann::json send_req = {
+        {"jsonrpc", "2.0"},
+        {"id", NextId()},
+        {"method", "sendtopaymentcode"},
+        {"params", send_params},
+    };
+    return CallRpc(opts, send_req);
+  }
+
+  qryptcoin::crypto::PaymentCodeShortId short_id{};
+  std::string short_id_error;
+  const bool is_short_id =
+      qryptcoin::crypto::DecodePaymentCodeShortId(destination, cfg.bech32_hrp, &short_id,
+                                                  &short_id_error);
+
+  qryptcoin::crypto::PaymentCodeV1 paycode_v1{};
+  std::string paycode_v1_error;
+  const bool is_paycode_v1 =
+      qryptcoin::crypto::DecodePaymentCodeV1(destination, cfg.bech32_hrp, &paycode_v1,
+                                             &paycode_v1_error);
 
   std::string address = destination;
-  if (is_paycode) {
+  if (is_paycode_v1 || is_short_id) {
     if (!resolver_opt) {
-      throw std::runtime_error("sendto: --resolver=<host:port> is required for payment codes");
+      throw std::runtime_error(
+          "sendto: --resolver=<host:port> is required for payment codes and short ids");
     }
     const auto [resolver_host, resolver_port] = ParseHostPort(*resolver_opt);
 
@@ -945,6 +1019,45 @@ nlohmann::json HandleSendTo(const CliOptions& opts) {
     }
 
     constexpr std::uint32_t kExpiryDeltaBlocks = 12;
+
+    if (is_short_id) {
+      nlohmann::json resolve_req = {
+          {"jsonrpc", "2.0"},
+          {"id", NextId()},
+          {"method", "resolvepaymentcodeshort"},
+          {"params", {{"short_id", destination}}},
+      };
+      nlohmann::json resolve_resp =
+          CallJsonRpcOnce(resolver_host, resolver_port, resolve_req, resolver_timeout_ms);
+      if (resolve_resp.contains("error")) {
+        throw std::runtime_error("resolver error: " + resolve_resp.at("error").dump());
+      }
+      if (!resolve_resp.contains("result") || !resolve_resp.at("result").is_object()) {
+        throw std::runtime_error("resolver response missing result object");
+      }
+      const auto& result = resolve_resp.at("result");
+      if (!result.contains("payment_code_v2") || !result.at("payment_code_v2").is_string()) {
+        throw std::runtime_error("resolver response missing result.payment_code_v2");
+      }
+      const std::string resolved_paycode = result.at("payment_code_v2").get<std::string>();
+
+      nlohmann::json send_params = {{"payment_code", resolved_paycode}, {"amount", amount}};
+      if (fee_rate.has_value()) {
+        send_params["fee_rate"] = *fee_rate;
+      }
+      nlohmann::json send_req = {
+          {"jsonrpc", "2.0"},
+          {"id", NextId()},
+          {"method", "sendtopaymentcode"},
+          {"params", send_params},
+      };
+      std::cerr << "paycode_short_resolved"
+                << " short_id=" << destination
+                << " resolver_policy=" << resolver_policy
+                << " resolver=" << resolver_host << ":" << resolver_port
+                << "\n";
+      return CallRpc(opts, send_req);
+    }
 
     auto get_sender_height = [&]() -> std::uint64_t {
       nlohmann::json height_req = {
@@ -1055,6 +1168,7 @@ nlohmann::json HandleSendTo(const CliOptions& opts) {
     // If it is not a payment code, treat it as a normal address.
     qryptcoin::crypto::P2QHDescriptor desc{};
     if (!qryptcoin::crypto::DecodeP2QHAddress(address, cfg.bech32_hrp, &desc)) {
+      const std::string paycode_error = !paycode_v1_error.empty() ? paycode_v1_error : paycode_v2_error;
       if (!paycode_error.empty()) {
         throw std::runtime_error("invalid destination: " + paycode_error);
       }

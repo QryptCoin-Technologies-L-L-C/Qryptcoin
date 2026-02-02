@@ -5,12 +5,14 @@
 #include <chrono>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 #include <unordered_map>
 
 #include "consensus/utxo.hpp"
 #include "crypto/pq_engine.hpp"
+#include "crypto/payment_code.hpp"
 #include "crypto/p2qh_descriptor.hpp"
 #include "primitives/transaction.hpp"
 
@@ -114,6 +116,10 @@ class HDWallet {
                                 DerivedKeyInfo* out) const;
 
   ~HDWallet();
+  HDWallet(const HDWallet&) = delete;
+  HDWallet& operator=(const HDWallet&) = delete;
+  HDWallet(HDWallet&&) = default;
+  HDWallet& operator=(HDWallet&&) = default;
 
   std::string NewAddress(crypto::SignatureAlgorithm policy);
   std::string NewAddress(bool hybrid_override = false);
@@ -124,6 +130,8 @@ class HDWallet {
                                  std::string* out_address,
                                  std::string* error = nullptr);
   std::string PaymentCode() const;
+  std::string PaymentCodeV2() const;
+  std::string PaymentCodeV2ShortId() const;
   std::vector<std::string> ListAddresses() const;
   bool ForgetAddress(const std::string& address);
   std::vector<std::string> ListDescriptorHexes() const;
@@ -145,9 +153,23 @@ class HDWallet {
   bool MaybeTrackOutput(const primitives::Hash256& txid, std::size_t vout_index,
                         const primitives::CTxOut& txout, bool is_coinbase,
                         primitives::Amount tx_fee_miks = 0);
+  bool MaybeTrackStealthTransaction(const primitives::Hash256& txid,
+                                    const primitives::CTransaction& tx,
+                                    bool is_coinbase,
+                                    primitives::Amount tx_fee_miks = 0);
   std::optional<CreatedTransaction> CreateTransaction(
       const std::vector<std::pair<std::string, primitives::Amount>>& outputs,
       primitives::Amount fee_rate, std::string* error);
+  std::optional<CreatedTransaction> CreateTransactionWithVersion(
+      const std::vector<std::pair<std::string, primitives::Amount>>& outputs,
+      primitives::Amount fee_rate,
+      std::uint32_t tx_version,
+      std::string* error);
+  std::optional<CreatedTransaction> CreateTransactionWithWitnessPayload(
+      const std::vector<std::pair<std::string, primitives::Amount>>& outputs,
+      primitives::Amount fee_rate,
+      std::span<const std::uint8_t> witness_payload,
+      std::string* error);
   bool CommitTransaction(const CreatedTransaction& tx, std::string* error = nullptr);
   bool Save() const;
   std::string ExportSeedHex() const;
@@ -230,6 +252,15 @@ class HDWallet {
   bool ReadAndDecrypt(std::vector<std::uint8_t>* payload, std::uint16_t* version) const;
 
   KeyMaterial DeriveKeyMaterial(std::uint32_t index, crypto::SignatureAlgorithm algorithm) const;
+  KeyMaterial DeriveStealthKeyMaterial(const std::array<std::uint8_t, 32>& key_seed) const;
+  std::optional<CreatedTransaction> CreateTransactionInternal(
+      const std::vector<std::pair<std::string, primitives::Amount>>& outputs,
+      primitives::Amount fee_rate,
+      std::uint32_t tx_version,
+      std::span<const std::uint8_t> witness_payload,
+      std::string* error);
+  crypto::PaymentCodeV2 BuildPaymentCodeV2() const;
+  const crypto::QPqKyberKEM& PaymentCodeV2Kem() const;
   std::string DeriveAddressInternal(std::uint32_t index, crypto::SignatureAlgorithm algorithm);
   primitives::COutPoint MakeChangeOutPoint(const primitives::CTransaction& tx,
                                            std::uint32_t change_index) const;
@@ -254,6 +285,8 @@ class HDWallet {
   std::vector<AddressEntry> addresses_;
   std::vector<WalletUTXO> utxos_;
   std::vector<std::uint32_t> burned_key_indices_;
+  std::unordered_map<primitives::COutPoint, std::array<std::uint8_t, 32>,
+                     consensus::OutPointHasher> stealth_spend_seeds_;
   std::unordered_map<std::string, std::size_t> address_index_;
   struct ProgramHasher {
     std::size_t operator()(const primitives::Hash256& program) const noexcept {
@@ -275,6 +308,7 @@ class HDWallet {
   std::unordered_map<primitives::Hash256, std::size_t, ProgramHasher> watch_only_program_index_;
   std::vector<WalletTransaction> transactions_;
   std::vector<PaymentCodeReservation> payment_code_reservations_;
+  mutable std::optional<crypto::QPqKyberKEM> paycode_v2_kem_;
   bool locked_{false};
   std::optional<std::uint32_t> birth_height_;
   std::optional<std::uint32_t> last_scan_height_;

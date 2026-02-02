@@ -35,6 +35,8 @@
 #include "consensus/witness_commitment.hpp"
 #include "crypto/hash.hpp"
 #include "crypto/payment_code.hpp"
+#include "crypto/payment_code_short.hpp"
+#include "crypto/stealth_address.hpp"
 #include "crypto/p2qh_address.hpp"
 #include "crypto/crypto_suite.hpp"
 #include "crypto/p2qh_descriptor.hpp"
@@ -63,6 +65,42 @@ constexpr std::uint32_t kDefaultMaxSubmitBlockPerSecond = 10;
 // Minimum relay fee rate (policy) in Miks per virtual byte.
 // This is the baseline "mempool floor" when the mempool is otherwise empty.
 constexpr double kMinRelayFeeMiksPerVb = 1.0;
+
+// Optional commit-delay mode for transaction relay. Transactions that set the
+// high bit in `tx.version` require a prior commitment announcement before the
+// full transaction is accepted for mempool relay.
+constexpr std::uint32_t kTxCommitDelayFlag = 0x80000000u;
+constexpr std::uint32_t kTxCommitDelayMask = 0x0000FFFFu;
+constexpr std::uint32_t kMaxTxCommitDelayBlocks = 10'000u;
+constexpr std::uint64_t kTxCommitmentTtlSeconds = 7ULL * 24ULL * 60ULL * 60ULL;
+constexpr std::size_t kMaxTxCommitmentEntries = 50'000;
+
+bool TxRequiresCommitment(const primitives::CTransaction& tx) {
+  return (tx.version & kTxCommitDelayFlag) != 0u;
+}
+
+std::uint32_t TxCommitDelayBlocks(const primitives::CTransaction& tx) {
+  return tx.version & kTxCommitDelayMask;
+}
+
+primitives::Hash256 ComputeTxCommitmentHash(std::span<const std::uint8_t> raw_tx_bytes) {
+  const auto digest = crypto::Sha3_256(raw_tx_bytes);
+  primitives::Hash256 out{};
+  std::copy(digest.begin(), digest.end(), out.begin());
+  return out;
+}
+
+bool DecodeHash256Hex(std::string_view hex, primitives::Hash256* out) {
+  if (!out) {
+    return false;
+  }
+  std::vector<std::uint8_t> bytes;
+  if (!util::HexDecode(std::string(hex), &bytes) || bytes.size() != out->size()) {
+    return false;
+  }
+  std::copy(bytes.begin(), bytes.end(), out->begin());
+  return true;
+}
 
 bool ExtractRevealedPubkeyHashes(const primitives::CTransaction& tx,
                                  std::vector<primitives::Hash256>* out,
@@ -417,6 +455,8 @@ bool IsReadOnlyMethod(const std::string& method) {
       "getbestblockhash",   "getblockcount",     "getwalletinfo",
       "waitfornewblock",    "waitforblockheight","waitforblock",
       "getpaymentcode",     "validatepaymentcode",
+      "resolvepaymentcodeshort",
+      "getcommitmentstatus",
       "listtransactions",   "listutxos",         "listaddresses",
       "listwatchonly",      "getpqinfo",         "getnetworkinfo",
       "getpeerinfo",        "getmininginfo",     "getmempoolinfo",
@@ -433,6 +473,8 @@ bool IsWalletMethod(const std::string& method) {
   static const std::unordered_set<std::string> kWalletMethods{
       "getnewaddress",     "sendtoaddress",    "getwalletinfo",
       "getpaymentcode",    "validatepaymentcode", "resolvepaymentcode",
+      "sendtopaymentcode",
+      "sendcommitment",    "revealcommitment",
       "listtransactions",  "listutxos",        "listaddresses",
       "forgetaddresses",   "importaddress",    "listwatchonly",
       "removewatchonly",   "getpqinfo",        "createwallet",
@@ -640,13 +682,25 @@ nlohmann::json RpcServer::Handle(const nlohmann::json& request) {
     } else if (method == "getnewaddress") {
       response["result"] = HandleGetNewAddress(params);
     } else if (method == "getpaymentcode") {
-      response["result"] = HandleGetPaymentCode();
+      response["result"] = HandleGetPaymentCode(params);
     } else if (method == "validatepaymentcode") {
       response["result"] = HandleValidatePaymentCode(params);
     } else if (method == "resolvepaymentcode") {
       response["result"] = HandleResolvePaymentCode(params);
+    } else if (method == "registerpaymentcode") {
+      response["result"] = HandleRegisterPaymentCode(params);
+    } else if (method == "resolvepaymentcodeshort") {
+      response["result"] = HandleResolvePaymentCodeShort(params);
     } else if (method == "sendtoaddress") {
       response["result"] = HandleSendToAddress(params);
+    } else if (method == "sendtopaymentcode") {
+      response["result"] = HandleSendToPaymentCode(params);
+    } else if (method == "sendcommitment") {
+      response["result"] = HandleSendCommitment(params);
+    } else if (method == "revealcommitment") {
+      response["result"] = HandleRevealCommitment(params);
+    } else if (method == "getcommitmentstatus") {
+      response["result"] = HandleGetCommitmentStatus(params);
     } else if (method == "getwalletinfo") {
       response["result"] = HandleGetWalletInfo();
     } else if (method == "listtransactions") {
@@ -1102,11 +1156,37 @@ nlohmann::json RpcServer::HandleGetNewAddress(const nlohmann::json& params) {
   return result;
 }
 
-nlohmann::json RpcServer::HandleGetPaymentCode() const {
+nlohmann::json RpcServer::HandleGetPaymentCode(const nlohmann::json& params) const {
   const auto& wallet = WalletOrThrow();
+  int version = 2;
+  if (params.contains("version")) {
+    version = params.at("version").get<int>();
+  } else if (params.contains("format")) {
+    const auto fmt = params.at("format").get<std::string>();
+    if (fmt == "PAYCODE_V1") {
+      version = 1;
+    } else if (fmt == "PAYCODE_V2") {
+      version = 2;
+    }
+  }
+
+  const auto code_v1 = wallet.PaymentCode();
+  const auto code_v2 = wallet.PaymentCodeV2();
+  const auto code_v2_short_id = wallet.PaymentCodeV2ShortId();
   nlohmann::json result;
-  result["payment_code"] = wallet.PaymentCode();
-  result["format"] = "PAYCODE_V1";
+  result["payment_code_v1"] = code_v1;
+  result["payment_code_v2"] = code_v2;
+  result["payment_code_v2_short_id"] = code_v2_short_id;
+  if (version == 1) {
+    result["payment_code"] = code_v1;
+    result["format"] = "PAYCODE_V1";
+  } else if (version == 2) {
+    result["payment_code"] = code_v2;
+    result["format"] = "PAYCODE_V2";
+    result["payment_code_short_id"] = code_v2_short_id;
+  } else {
+    ThrowRpcError(-32602, "unsupported payment code version");
+  }
   result["encoding"] = "base32";
   return result;
 }
@@ -1121,22 +1201,12 @@ nlohmann::json RpcServer::HandleValidatePaymentCode(const nlohmann::json& params
     ThrowRpcError(-32602, "missing payment_code");
   }
 
-  crypto::PaymentCodeV1 parsed{};
-  std::string decode_error;
-  if (!crypto::DecodePaymentCodeV1(code, config::GetNetworkConfig().bech32_hrp, &parsed,
-                                   &decode_error)) {
-    ThrowRpcError(-32602, decode_error.empty() ? "invalid payment code" : decode_error);
-  }
-
   const auto& cfg = config::GetNetworkConfig();
   const std::uint32_t expected_network_id =
       static_cast<std::uint32_t>(cfg.message_start[0]) |
       (static_cast<std::uint32_t>(cfg.message_start[1]) << 8) |
       (static_cast<std::uint32_t>(cfg.message_start[2]) << 16) |
       (static_cast<std::uint32_t>(cfg.message_start[3]) << 24);
-  if (parsed.network_id != expected_network_id) {
-    ThrowRpcError(-32602, "payment code network mismatch");
-  }
 
   auto to_hex = [](std::span<const std::uint8_t> bytes) -> std::string {
     return util::HexEncode(bytes);
@@ -1144,10 +1214,39 @@ nlohmann::json RpcServer::HandleValidatePaymentCode(const nlohmann::json& params
 
   nlohmann::json result;
   result["valid"] = true;
-  result["network_id_le"] = parsed.network_id;
-  result["kdf_id"] = parsed.kdf_id;
-  result["scan_pubkey"] = to_hex(parsed.scan_pubkey);
-  result["spend_root_commitment"] = to_hex(parsed.spend_root_commitment);
+
+  crypto::PaymentCodeV2 parsed_v2{};
+  std::string decode_error_v2;
+  if (crypto::DecodePaymentCodeV2(code, cfg.bech32_hrp, &parsed_v2, &decode_error_v2)) {
+    if (parsed_v2.network_id != expected_network_id) {
+      ThrowRpcError(-32602, "payment code network mismatch");
+    }
+    result["format"] = "PAYCODE_V2";
+    result["network_id_le"] = parsed_v2.network_id;
+    result["scan_pubkey"] = to_hex(parsed_v2.scan_pubkey);
+    result["spend_root_commitment"] = to_hex(parsed_v2.spend_root_commitment);
+    result["kem"] = {{"name", "ML-KEM-768"},
+                     {"public_key_bytes", parsed_v2.scan_pubkey.size()},
+                     {"ciphertext_bytes", crypto::KyberCiphertextSize()},
+                     {"shared_secret_bytes", crypto::KyberSharedSecretSize()}};
+    return result;
+  }
+
+  crypto::PaymentCodeV1 parsed_v1{};
+  std::string decode_error_v1;
+  if (!crypto::DecodePaymentCodeV1(code, cfg.bech32_hrp, &parsed_v1, &decode_error_v1)) {
+    ThrowRpcError(-32602, decode_error_v1.empty()
+                              ? (decode_error_v2.empty() ? "invalid payment code" : decode_error_v2)
+                              : decode_error_v1);
+  }
+  if (parsed_v1.network_id != expected_network_id) {
+    ThrowRpcError(-32602, "payment code network mismatch");
+  }
+  result["format"] = "PAYCODE_V1";
+  result["network_id_le"] = parsed_v1.network_id;
+  result["kdf_id"] = parsed_v1.kdf_id;
+  result["scan_pubkey"] = to_hex(parsed_v1.scan_pubkey);
+  result["spend_root_commitment"] = to_hex(parsed_v1.spend_root_commitment);
   return result;
 }
 
@@ -1161,14 +1260,20 @@ nlohmann::json RpcServer::HandleResolvePaymentCode(const nlohmann::json& params)
     ThrowRpcError(-32602, "missing payment_code");
   }
 
+  const auto& cfg = config::GetNetworkConfig();
+  crypto::PaymentCodeV2 v2{};
+  std::string v2_error;
+  if (crypto::DecodePaymentCodeV2(code, cfg.bech32_hrp, &v2, &v2_error)) {
+    ThrowRpcError(-32602, "PAYCODE_V2 is non-interactive; use sendtopaymentcode");
+  }
+
   crypto::PaymentCodeV1 parsed{};
   std::string decode_error;
-  if (!crypto::DecodePaymentCodeV1(code, config::GetNetworkConfig().bech32_hrp, &parsed,
+  if (!crypto::DecodePaymentCodeV1(code, cfg.bech32_hrp, &parsed,
                                    &decode_error)) {
     ThrowRpcError(-32602, decode_error.empty() ? "invalid payment code encoding" : decode_error);
   }
 
-  const auto& cfg = config::GetNetworkConfig();
   const std::uint32_t expected_network_id =
       static_cast<std::uint32_t>(cfg.message_start[0]) |
       (static_cast<std::uint32_t>(cfg.message_start[1]) << 8) |
@@ -1281,6 +1386,92 @@ nlohmann::json RpcServer::HandleResolvePaymentCode(const nlohmann::json& params)
        "Unauthenticated resolution. Use only trusted local transport or an authenticated secure channel."},
   };
 
+  return result;
+}
+
+nlohmann::json RpcServer::HandleRegisterPaymentCode(const nlohmann::json& params) {
+  std::string code;
+  if (params.contains("payment_code_v2")) {
+    code = params.at("payment_code_v2").get<std::string>();
+  } else if (params.contains("payment_code")) {
+    code = params.at("payment_code").get<std::string>();
+  } else if (params.contains("code")) {
+    code = params.at("code").get<std::string>();
+  } else {
+    ThrowRpcError(-32602, "missing payment_code_v2");
+  }
+
+  const auto& cfg = config::GetNetworkConfig();
+  const std::uint32_t expected_network_id =
+      static_cast<std::uint32_t>(cfg.message_start[0]) |
+      (static_cast<std::uint32_t>(cfg.message_start[1]) << 8) |
+      (static_cast<std::uint32_t>(cfg.message_start[2]) << 16) |
+      (static_cast<std::uint32_t>(cfg.message_start[3]) << 24);
+
+  crypto::PaymentCodeV2 parsed{};
+  std::string decode_error;
+  if (!crypto::DecodePaymentCodeV2(code, cfg.bech32_hrp, &parsed, &decode_error)) {
+    ThrowRpcError(-32602, decode_error.empty() ? "invalid payment code" : decode_error);
+  }
+  if (parsed.network_id != expected_network_id) {
+    ThrowRpcError(-32602, "payment code network mismatch");
+  }
+
+  const auto short_id = crypto::PaymentCodeShortId::FromPaymentCodeV2(parsed);
+  const auto short_id_str = crypto::EncodePaymentCodeShortId(short_id, cfg.bech32_hrp);
+
+  bool inserted = false;
+  {
+    std::lock_guard<std::mutex> lock(paycode_registry_mutex_);
+    auto [it, ok] = paycode_v2_registry_.emplace(short_id.id, code);
+    if (!ok && it->second != code) {
+      ThrowRpcError(-32002, "short id already registered to a different payment code");
+    }
+    inserted = ok;
+  }
+
+  nlohmann::json result;
+  result["short_id"] = short_id_str;
+  result["payment_code_v2"] = code;
+  result["registered"] = true;
+  result["inserted"] = inserted;
+  return result;
+}
+
+nlohmann::json RpcServer::HandleResolvePaymentCodeShort(const nlohmann::json& params) const {
+  std::string short_id_str;
+  if (params.contains("short_id")) {
+    short_id_str = params.at("short_id").get<std::string>();
+  } else if (params.contains("payment_code_short_id")) {
+    short_id_str = params.at("payment_code_short_id").get<std::string>();
+  } else if (params.contains("code")) {
+    short_id_str = params.at("code").get<std::string>();
+  } else {
+    ThrowRpcError(-32602, "missing short_id");
+  }
+
+  const auto& cfg = config::GetNetworkConfig();
+  crypto::PaymentCodeShortId parsed{};
+  std::string decode_error;
+  if (!crypto::DecodePaymentCodeShortId(short_id_str, cfg.bech32_hrp, &parsed, &decode_error)) {
+    ThrowRpcError(-32602, decode_error.empty() ? "invalid short id" : decode_error);
+  }
+
+  std::string code_v2;
+  {
+    std::lock_guard<std::mutex> lock(paycode_registry_mutex_);
+    auto it = paycode_v2_registry_.find(parsed.id);
+    if (it == paycode_v2_registry_.end()) {
+      ThrowRpcError(-42001, "unknown payment code short id");
+    }
+    code_v2 = it->second;
+  }
+
+  nlohmann::json result;
+  result["short_id"] = short_id_str;
+  result["payment_code_v2"] = code_v2;
+  result["payment_code"] = code_v2;
+  result["format"] = "PAYCODE_V2";
   return result;
 }
 
@@ -1584,6 +1775,396 @@ nlohmann::json RpcServer::HandleSendToAddress(const nlohmann::json& params) {
   if (broadcast_peers == 0) {
     result["broadcast_warning"] =
         "transaction accepted locally but was not announced to any peers";
+  }
+  return result;
+}
+
+nlohmann::json RpcServer::HandleSendToPaymentCode(const nlohmann::json& params) {
+  if (!params.contains("payment_code") && !params.contains("code")) {
+    throw std::runtime_error("payment_code is required");
+  }
+  if (!params.contains("amount")) {
+    throw std::runtime_error("amount is required");
+  }
+
+  std::string code;
+  if (params.contains("payment_code")) {
+    code = params.at("payment_code").get<std::string>();
+  } else {
+    code = params.at("code").get<std::string>();
+  }
+
+  auto amount = ParseAmount(params.at("amount"));
+  if (!amount) {
+    throw std::runtime_error("invalid amount");
+  }
+
+  primitives::Amount fee_rate = 0;
+  bool manual_fee = false;
+  bool require_broadcast = false;
+  if (params.contains("fee_rate")) {
+    if (!params.at("fee_rate").is_number_integer()) {
+      throw std::runtime_error("fee_rate must be an integer");
+    }
+    fee_rate = params.at("fee_rate").get<std::uint64_t>();
+    manual_fee = true;
+  }
+  if (params.contains("require_broadcast")) {
+    require_broadcast = params.at("require_broadcast").get<bool>();
+  }
+  if (!primitives::MoneyRange(fee_rate)) {
+    throw std::runtime_error("fee_rate out of range");
+  }
+  if (!manual_fee) {
+    double suggested =
+        fee_estimator_.EstimateFeeRate(/*target_blocks=*/3, mempool_min_fee_miks_per_vb_);
+    if (suggested <= 0.0) {
+      suggested = mempool_min_fee_miks_per_vb_ > 0.0 ? mempool_min_fee_miks_per_vb_ : 1.0;
+    }
+    double rounded = std::round(suggested);
+    if (rounded < mempool_min_fee_miks_per_vb_) {
+      rounded = std::ceil(mempool_min_fee_miks_per_vb_);
+    }
+    if (rounded < 1.0) {
+      rounded = 1.0;
+    }
+    primitives::Amount converted = 0;
+    if (!DoubleToMoney(rounded, &converted)) {
+      throw std::runtime_error("fee_rate out of range");
+    }
+    fee_rate = converted;
+  }
+
+  const auto& cfg = config::GetNetworkConfig();
+  crypto::PaymentCodeV2 paycode{};
+  std::string decode_error;
+  if (!crypto::DecodePaymentCodeV2(code, cfg.bech32_hrp, &paycode, &decode_error)) {
+    ThrowRpcError(-32602, decode_error.empty() ? "invalid payment code" : decode_error);
+  }
+  const std::uint32_t expected_network_id =
+      static_cast<std::uint32_t>(cfg.message_start[0]) |
+      (static_cast<std::uint32_t>(cfg.message_start[1]) << 8) |
+      (static_cast<std::uint32_t>(cfg.message_start[2]) << 16) |
+      (static_cast<std::uint32_t>(cfg.message_start[3]) << 24);
+  if (paycode.network_id != expected_network_id) {
+    ThrowRpcError(-32602, "payment code network mismatch");
+  }
+
+  crypto::KyberEncapsulationResult kem{};
+  try {
+    kem = crypto::QPqKyberKEM::Encapsulate(paycode.scan_pubkey);
+  } catch (const std::exception& ex) {
+    ThrowRpcError(-32603, std::string("Kyber encapsulation failed: ") + ex.what());
+  }
+
+  crypto::StealthDerivationV1 derived{};
+  std::string derive_error;
+  if (!crypto::DeriveStealthOutputV1(
+          std::span<const std::uint8_t>(kem.shared_secret.data(), kem.shared_secret.size()),
+          paycode,
+          std::span<const std::uint8_t>(kem.ciphertext.data(), kem.ciphertext.size()),
+          &derived, &derive_error)) {
+    ThrowRpcError(-32603, derive_error.empty() ? "stealth derivation failed" : derive_error);
+  }
+  const auto address = crypto::EncodeP2QHAddress(derived.descriptor, cfg.bech32_hrp);
+
+  auto& wallet = WalletOrThrow();
+  std::vector<std::pair<std::string, primitives::Amount>> outputs = {{address, *amount}};
+  std::string error;
+  auto created = wallet.CreateTransactionWithWitnessPayload(
+      outputs, fee_rate, std::span<const std::uint8_t>(kem.ciphertext.data(), kem.ciphertext.size()),
+      &error);
+  if (!created) {
+    throw std::runtime_error("tx creation failed: " + error);
+  }
+  const auto& tx = created->tx;
+
+  std::string reject_reason;
+  const bool accepted = AddToMempool(tx, std::nullopt, &reject_reason);
+  if (!accepted) {
+    if (reject_reason.empty()) {
+      reject_reason = "rejected";
+    }
+    throw std::runtime_error("transaction rejected: " + reject_reason);
+  }
+  std::string commit_error;
+  if (!wallet.CommitTransaction(*created, &commit_error)) {
+    throw std::runtime_error("wallet commit failed: " + commit_error);
+  }
+  wallet.Save();
+  const std::size_t broadcast_peers = BroadcastTransaction(tx);
+  if (require_broadcast && broadcast_peers == 0) {
+    throw std::runtime_error("transaction accepted but not broadcast to any peers: " +
+                             TxIdHex(tx));
+  }
+  nlohmann::json result;
+  result["txid"] = TxIdHex(tx);
+  result["hex"] = SerializeTransactionHex(tx);
+  result["stealth_address"] = address;
+  result["metadata"] = TxToJson(tx, wallet_.get(), created->fee);
+  result["accepted_to_mempool"] = accepted;
+  result["broadcast_peers"] = broadcast_peers;
+  result["broadcasted"] = broadcast_peers > 0;
+  if (broadcast_peers == 0) {
+    result["broadcast_warning"] =
+        "transaction accepted locally but was not announced to any peers";
+  }
+  return result;
+}
+
+nlohmann::json RpcServer::HandleSendCommitment(const nlohmann::json& params) {
+  if (!params.contains("address") || !params.contains("amount")) {
+    throw std::runtime_error("address and amount are required");
+  }
+  auto& wallet = WalletOrThrow();
+  const auto address = params.at("address").get<std::string>();
+  auto amount = ParseAmount(params.at("amount"));
+  if (!amount) {
+    throw std::runtime_error("invalid amount");
+  }
+
+  std::uint32_t delay_blocks = 1;
+  if (params.contains("delay_blocks")) {
+    if (!params.at("delay_blocks").is_number_unsigned() && !params.at("delay_blocks").is_number_integer()) {
+      throw std::runtime_error("delay_blocks must be an integer");
+    }
+    const auto raw = params.at("delay_blocks").get<std::uint64_t>();
+    delay_blocks = raw > std::numeric_limits<std::uint32_t>::max()
+                       ? std::numeric_limits<std::uint32_t>::max()
+                       : static_cast<std::uint32_t>(raw);
+  }
+  if (delay_blocks == 0 || delay_blocks > kMaxTxCommitDelayBlocks) {
+    throw std::runtime_error("delay_blocks out of range");
+  }
+
+  primitives::Amount fee_rate = 0;
+  bool manual_fee = false;
+  bool require_broadcast = false;
+  if (params.contains("fee_rate")) {
+    if (!params.at("fee_rate").is_number_integer()) {
+      throw std::runtime_error("fee_rate must be an integer");
+    }
+    fee_rate = params.at("fee_rate").get<std::uint64_t>();
+    manual_fee = true;
+  }
+  if (params.contains("require_broadcast")) {
+    require_broadcast = params.at("require_broadcast").get<bool>();
+  }
+  if (!primitives::MoneyRange(fee_rate)) {
+    throw std::runtime_error("fee_rate out of range");
+  }
+  if (!manual_fee) {
+    double suggested =
+        fee_estimator_.EstimateFeeRate(/*target_blocks=*/3, mempool_min_fee_miks_per_vb_);
+    if (suggested <= 0.0) {
+      suggested = mempool_min_fee_miks_per_vb_ > 0.0 ? mempool_min_fee_miks_per_vb_ : 1.0;
+    }
+    double rounded = std::round(suggested);
+    if (rounded < mempool_min_fee_miks_per_vb_) {
+      rounded = std::ceil(mempool_min_fee_miks_per_vb_);
+    }
+    if (rounded < 1.0) {
+      rounded = 1.0;
+    }
+    primitives::Amount converted = 0;
+    if (!DoubleToMoney(rounded, &converted)) {
+      throw std::runtime_error("fee_rate out of range");
+    }
+    fee_rate = converted;
+  }
+
+  const std::uint32_t tx_version = kTxCommitDelayFlag | delay_blocks;
+  std::vector<std::pair<std::string, primitives::Amount>> outputs = {{address, *amount}};
+  std::string error;
+  auto created = wallet.CreateTransactionWithVersion(outputs, fee_rate, tx_version, &error);
+  if (!created) {
+    throw std::runtime_error("tx creation failed: " + error);
+  }
+  const auto& tx = created->tx;
+
+  std::vector<std::uint8_t> raw;
+  primitives::serialize::SerializeTransaction(tx, &raw);
+  const auto commitment =
+      ComputeTxCommitmentHash(std::span<const std::uint8_t>(raw.data(), raw.size()));
+  const auto now_seconds = static_cast<std::uint64_t>(std::time(nullptr));
+  const auto height_u64 = static_cast<std::uint64_t>(chain_.Height());
+  const std::uint32_t height =
+      height_u64 > std::numeric_limits<std::uint32_t>::max()
+          ? std::numeric_limits<std::uint32_t>::max()
+          : static_cast<std::uint32_t>(height_u64);
+
+  {
+    std::lock_guard<std::mutex> lock(tx_commitment_mutex_);
+    auto& entry = tx_commitments_[commitment];
+    if (entry.first_seen_time == 0) {
+      entry.first_seen_height = height;
+      entry.first_seen_time = now_seconds;
+    } else if (height < entry.first_seen_height) {
+      entry.first_seen_height = height;
+    }
+    entry.locally_created = true;
+    entry.tx = tx;
+  }
+
+  std::string commit_error;
+  if (!wallet.CommitTransaction(*created, &commit_error)) {
+    throw std::runtime_error("wallet commit failed: " + commit_error);
+  }
+  wallet.Save();
+
+  const std::size_t broadcast_peers = BroadcastTransactionCommitment(commitment);
+  if (require_broadcast && broadcast_peers == 0) {
+    throw std::runtime_error("commitment created but not broadcast to any peers: " +
+                             HashToHex(commitment));
+  }
+
+  nlohmann::json result;
+  result["commitment_id"] = HashToHex(commitment);
+  result["delay_blocks"] = delay_blocks;
+  result["txid"] = TxIdHex(tx);
+  result["hex"] = SerializeTransactionHex(tx);
+  result["metadata"] = TxToJson(tx, wallet_.get(), created->fee);
+  result["broadcast_peers"] = broadcast_peers;
+  result["broadcasted"] = broadcast_peers > 0;
+  if (broadcast_peers == 0) {
+    result["broadcast_warning"] =
+        "commitment created locally but was not announced to any peers";
+  }
+  return result;
+}
+
+nlohmann::json RpcServer::HandleRevealCommitment(const nlohmann::json& params) {
+  std::string commitment_hex;
+  if (params.contains("commitment_id")) {
+    commitment_hex = params.at("commitment_id").get<std::string>();
+  } else if (params.contains("id")) {
+    commitment_hex = params.at("id").get<std::string>();
+  } else {
+    throw std::runtime_error("commitment_id is required");
+  }
+
+  primitives::Hash256 commitment{};
+  if (!DecodeHash256Hex(commitment_hex, &commitment)) {
+    throw std::runtime_error("invalid commitment_id");
+  }
+
+  TxCommitmentEntry entry{};
+  {
+    std::lock_guard<std::mutex> lock(tx_commitment_mutex_);
+    auto it = tx_commitments_.find(commitment);
+    if (it == tx_commitments_.end()) {
+      throw std::runtime_error("unknown commitment_id");
+    }
+    entry = it->second;
+  }
+  if (!entry.tx.has_value()) {
+    throw std::runtime_error("no local transaction stored for this commitment_id");
+  }
+  const auto& tx = *entry.tx;
+
+  const std::uint32_t delay_blocks = TxCommitDelayBlocks(tx);
+  if (!TxRequiresCommitment(tx) || delay_blocks == 0 || delay_blocks > kMaxTxCommitDelayBlocks) {
+    throw std::runtime_error("stored transaction does not use commit-delay mode");
+  }
+
+  const auto height_u64 = static_cast<std::uint64_t>(chain_.Height());
+  const auto required =
+      static_cast<std::uint64_t>(entry.first_seen_height) + static_cast<std::uint64_t>(delay_blocks);
+  if (height_u64 < required) {
+    const auto remaining = required - height_u64;
+    throw std::runtime_error("commitment delay not satisfied (" + std::to_string(remaining) +
+                             " blocks remaining)");
+  }
+
+  std::string reject_reason;
+  const bool accepted = AddToMempool(tx, std::nullopt, &reject_reason);
+  if (!accepted) {
+    if (reject_reason.empty()) {
+      reject_reason = "rejected";
+    }
+    throw std::runtime_error("transaction rejected: " + reject_reason);
+  }
+
+  const std::size_t broadcast_peers = BroadcastTransaction(tx);
+  {
+    std::lock_guard<std::mutex> lock(tx_commitment_mutex_);
+    auto it = tx_commitments_.find(commitment);
+    if (it != tx_commitments_.end()) {
+      it->second.revealed = true;
+    }
+  }
+
+  nlohmann::json result;
+  result["commitment_id"] = HashToHex(commitment);
+  result["txid"] = TxIdHex(tx);
+  result["hex"] = SerializeTransactionHex(tx);
+  result["accepted_to_mempool"] = accepted;
+  result["broadcast_peers"] = broadcast_peers;
+  result["broadcasted"] = broadcast_peers > 0;
+  if (broadcast_peers == 0) {
+    result["broadcast_warning"] =
+        "transaction accepted locally but was not announced to any peers";
+  }
+  return result;
+}
+
+nlohmann::json RpcServer::HandleGetCommitmentStatus(const nlohmann::json& params) const {
+  std::string commitment_hex;
+  if (params.contains("commitment_id")) {
+    commitment_hex = params.at("commitment_id").get<std::string>();
+  } else if (params.contains("id")) {
+    commitment_hex = params.at("id").get<std::string>();
+  } else {
+    throw std::runtime_error("commitment_id is required");
+  }
+
+  primitives::Hash256 commitment{};
+  if (!DecodeHash256Hex(commitment_hex, &commitment)) {
+    throw std::runtime_error("invalid commitment_id");
+  }
+
+  TxCommitmentEntry entry{};
+  {
+    std::lock_guard<std::mutex> lock(tx_commitment_mutex_);
+    auto it = tx_commitments_.find(commitment);
+    if (it == tx_commitments_.end()) {
+      throw std::runtime_error("unknown commitment_id");
+    }
+    entry = it->second;
+  }
+
+  const auto height_u64 = static_cast<std::uint64_t>(chain_.Height());
+  std::uint32_t delay_blocks = 0;
+  std::string txid_hex;
+  if (entry.tx.has_value()) {
+    delay_blocks = TxCommitDelayBlocks(*entry.tx);
+    txid_hex = TxIdHex(*entry.tx);
+  }
+  bool ready = false;
+  std::uint64_t blocks_remaining = 0;
+  if (delay_blocks > 0) {
+    const auto required =
+        static_cast<std::uint64_t>(entry.first_seen_height) + static_cast<std::uint64_t>(delay_blocks);
+    if (height_u64 >= required) {
+      ready = true;
+    } else {
+      blocks_remaining = required - height_u64;
+    }
+  }
+
+  nlohmann::json result;
+  result["commitment_id"] = HashToHex(commitment);
+  result["first_seen_height"] = entry.first_seen_height;
+  result["first_seen_time_unix"] = entry.first_seen_time;
+  result["current_height"] = height_u64;
+  result["locally_created"] = entry.locally_created;
+  result["has_transaction"] = entry.tx.has_value();
+  result["revealed"] = entry.revealed;
+  result["delay_blocks"] = delay_blocks;
+  result["ready_to_reveal"] = ready;
+  result["blocks_remaining"] = blocks_remaining;
+  if (!txid_hex.empty()) {
+    result["txid"] = txid_hex;
   }
   return result;
 }
@@ -3499,6 +4080,9 @@ void RpcServer::IndexWalletOutputs(const primitives::CBlock& block, bool save_wa
         changed = true;
       }
     }
+    if (wallet.MaybeTrackStealthTransaction(txid, tx, is_coinbase, fee_miks)) {
+      changed = true;
+    }
   }
   if (changed && save_wallet) {
     wallet.Save();
@@ -3555,6 +4139,36 @@ std::size_t RpcServer::BroadcastTransaction(const primitives::CTransaction& tx) 
     QueueTransactionRelayRetry(txid);
   }
   return announced;
+}
+
+std::size_t RpcServer::BroadcastTransactionCommitment(const primitives::Hash256& commitment,
+                                                      std::uint64_t exclude_peer_id) {
+  if (peers_ == nullptr) {
+    return 0;
+  }
+  net::messages::TxCommitmentMessage msg{};
+  std::copy(commitment.begin(), commitment.end(), msg.commitment.begin());
+  const auto encoded = net::messages::EncodeTxCommitment(msg);
+
+  std::size_t sent = 0;
+  const auto peers = peers_->GetPeerInfos();
+  if (exclude_peer_id == 0) {
+    peers_->BroadcastMessage(encoded);
+    sent = peers.size();
+  } else {
+    for (const auto& peer : peers) {
+      if (peer.id == exclude_peer_id) {
+        continue;
+      }
+      if (peers_->SendToPeer(peer.id, encoded)) {
+        ++sent;
+      }
+    }
+  }
+
+  std::cerr << (sent > 0 ? "[relay] tx commitment announced " : "[relay] warn: tx commitment announced ")
+            << HashToHex(commitment) << " peers=" << sent << "\n";
+  return sent;
 }
 
 void RpcServer::QueueTransactionRelayRetry(const primitives::Hash256& txid) {
@@ -3767,6 +4381,42 @@ bool RpcServer::AddToMempool(const primitives::CTransaction& tx,
     set_reject("invalid transaction weight");
     return false;
   }
+
+  // Optional commit-delay policy: when enabled on the transaction, require a
+  // prior commitment announcement and enforce a minimum block delay.
+  if (TxRequiresCommitment(tx)) {
+    const std::uint32_t delay_blocks = TxCommitDelayBlocks(tx);
+    if (delay_blocks == 0 || delay_blocks > kMaxTxCommitDelayBlocks) {
+      set_reject("invalid commitment delay");
+      return false;
+    }
+    if (chain_.Tip() == nullptr) {
+      set_reject("no active chain");
+      return false;
+    }
+    const auto commitment = ComputeTxCommitmentHash(
+        std::span<const std::uint8_t>(raw.data(), raw.size()));
+    TxCommitmentEntry entry{};
+    {
+      std::lock_guard<std::mutex> lock(tx_commitment_mutex_);
+      auto it = tx_commitments_.find(commitment);
+      if (it == tx_commitments_.end()) {
+        set_reject("missing transaction commitment");
+        return false;
+      }
+      entry = it->second;
+    }
+    const auto height_u64 = static_cast<std::uint64_t>(chain_.Height());
+    const auto required =
+        static_cast<std::uint64_t>(entry.first_seen_height) + static_cast<std::uint64_t>(delay_blocks);
+    if (height_u64 < required) {
+      const auto remaining = required - height_u64;
+      set_reject("commitment delay not satisfied (" + std::to_string(remaining) +
+                 " blocks remaining)");
+      return false;
+    }
+  }
+
   // Guard against pathological transactions with duplicated inputs: these are
   // rejected by consensus, but we check here so mempool bookkeeping stays
   // simple and bounded.
@@ -4147,6 +4797,59 @@ bool RpcServer::SubmitTransactionFromNetwork(const primitives::CTransaction& tx,
     return true;
   }
   return false;
+}
+
+void RpcServer::NotifyTransactionCommitmentFromNetwork(const primitives::Hash256& commitment,
+                                                       std::uint64_t peer_id) {
+  const auto now_seconds = static_cast<std::uint64_t>(std::time(nullptr));
+  const auto height_u64 = static_cast<std::uint64_t>(chain_.Height());
+  const std::uint32_t height =
+      height_u64 > std::numeric_limits<std::uint32_t>::max()
+          ? std::numeric_limits<std::uint32_t>::max()
+          : static_cast<std::uint32_t>(height_u64);
+
+  bool inserted = false;
+  {
+    std::lock_guard<std::mutex> lock(tx_commitment_mutex_);
+    auto [it, ok] = tx_commitments_.emplace(commitment, TxCommitmentEntry{});
+    auto& entry = it->second;
+    inserted = ok;
+    if (entry.first_seen_time == 0) {
+      entry.first_seen_height = height;
+      entry.first_seen_time = now_seconds;
+    } else if (height < entry.first_seen_height) {
+      entry.first_seen_height = height;
+    }
+
+    if (tx_commitments_.size() > kMaxTxCommitmentEntries) {
+      for (auto prune_it = tx_commitments_.begin(); prune_it != tx_commitments_.end();) {
+        const auto& candidate = prune_it->second;
+        if (!candidate.locally_created && candidate.first_seen_time != 0 &&
+            now_seconds > candidate.first_seen_time &&
+            now_seconds - candidate.first_seen_time >= kTxCommitmentTtlSeconds) {
+          prune_it = tx_commitments_.erase(prune_it);
+        } else {
+          ++prune_it;
+        }
+      }
+      if (tx_commitments_.size() > kMaxTxCommitmentEntries) {
+        std::size_t to_remove = tx_commitments_.size() - kMaxTxCommitmentEntries;
+        for (auto prune_it = tx_commitments_.begin();
+             prune_it != tx_commitments_.end() && to_remove > 0;) {
+          if (!prune_it->second.locally_created) {
+            prune_it = tx_commitments_.erase(prune_it);
+            --to_remove;
+          } else {
+            ++prune_it;
+          }
+        }
+      }
+    }
+  }
+
+  if (inserted) {
+    BroadcastTransactionCommitment(commitment, /*exclude_peer_id=*/peer_id);
+  }
 }
 
 void RpcServer::NotifyBlockConnected(const primitives::CBlock& block, std::uint32_t height) {

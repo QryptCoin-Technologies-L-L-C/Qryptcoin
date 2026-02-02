@@ -141,5 +141,18 @@ int main() {
     return EXIT_FAILURE;
   }
 
+  TxCommitmentMessage commit_msg{};
+  commit_msg.commitment.fill(0x42);
+  const auto encoded_commit = EncodeTxCommitment(commit_msg);
+  TxCommitmentMessage decoded_commit{};
+  if (!DecodeTxCommitment(encoded_commit, &decoded_commit)) {
+    std::cerr << "DecodeTxCommitment failed\n";
+    return EXIT_FAILURE;
+  }
+  if (decoded_commit.commitment != commit_msg.commitment) {
+    std::cerr << "Decoded commitment mismatch\n";
+    return EXIT_FAILURE;
+  }
+
   return EXIT_SUCCESS;
 }

@@ -56,6 +56,9 @@ class QPqKyberKEM {
   QPqKyberKEM& operator=(QPqKyberKEM&&) noexcept;
 
   static QPqKyberKEM Generate();
+  // Generate a deterministic keypair when a DeterministicOqsRng instance
+  // is active on the current thread. Intended for wallet key derivation.
+  static QPqKyberKEM GenerateDeterministic();
   static KyberEncapsulationResult Encapsulate(std::span<const std::uint8_t> peer_public_key);
 
   std::vector<std::uint8_t> Decapsulate(std::span<const std::uint8_t> ciphertext) const;
