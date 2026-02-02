@@ -155,6 +155,62 @@ bool TestCoinbaseMaturity() {
   return true;
 }
 
+bool TestWitnessExtensionIsCommitted() {
+  ScopedDeterministicRng rng(0x77778888ULL);
+  auto ctx = BuildDilithiumContext();
+
+  qryptcoin::consensus::UTXOSet view;
+  qryptcoin::primitives::COutPoint prevout{};
+  prevout.txid.fill(0xCD);
+  prevout.index = 0;
+
+  qryptcoin::consensus::Coin coin;
+  coin.out.value = 10 * qryptcoin::primitives::kMiksPerQRY;
+  coin.out.locking_descriptor = ctx.script.data;
+  view.AddCoin(prevout, coin);
+
+  qryptcoin::primitives::CTransaction tx;
+  tx.version = 2;
+  tx.vin.resize(1);
+  tx.vin[0].prevout = prevout;
+  tx.vout.resize(1);
+  tx.vout[0].value = 5 * qryptcoin::primitives::kMiksPerQRY;
+  tx.vout[0].locking_descriptor = ctx.script.data;
+
+  const auto base_sighash = qryptcoin::consensus::ComputeSighash(tx, 0, coin);
+
+  qryptcoin::primitives::WitnessStackItem reveal_item{ctx.reveal};
+  qryptcoin::primitives::WitnessStackItem sig_item{};  // placeholder
+  qryptcoin::primitives::WitnessStackItem extra_item{{0x01, 0x02, 0x03, 0x04}};
+  std::vector<qryptcoin::primitives::WitnessStackItem> witness = {reveal_item, sig_item, extra_item};
+
+  const auto sig_message = qryptcoin::consensus::ComputeP2QHSignatureMessage(
+      base_sighash,
+      std::span<const qryptcoin::primitives::WitnessStackItem>(witness.data(), witness.size()));
+  witness[1].data = ctx.dilithium.Sign(std::span<const std::uint8_t>(sig_message.data(), sig_message.size()));
+  tx.vin[0].witness_stack = witness;
+
+  qryptcoin::consensus::RevealedPubkeySet revealed_pubkeys;
+  std::string error;
+  if (!qryptcoin::consensus::ValidateTransaction(
+          tx, view, revealed_pubkeys, qryptcoin::consensus::kCoinbaseMaturity,
+          /*lock_time_cutoff_time=*/0, nullptr, &error)) {
+    std::cerr << "Extended witness validation failed: " << error << "\n";
+    return false;
+  }
+
+  // Mutate the witness extension without updating the signature; the
+  // transaction must now be invalid.
+  tx.vin[0].witness_stack[2].data[0] ^= 0x01;
+  if (qryptcoin::consensus::ValidateTransaction(
+          tx, view, revealed_pubkeys, qryptcoin::consensus::kCoinbaseMaturity,
+          /*lock_time_cutoff_time=*/0, nullptr, nullptr)) {
+    std::cerr << "Expected witness extension malleation to fail validation\n";
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 int main() {
@@ -162,6 +218,9 @@ int main() {
     return EXIT_FAILURE;
   }
   if (!TestCoinbaseMaturity()) {
+    return EXIT_FAILURE;
+  }
+  if (!TestWitnessExtensionIsCommitted()) {
     return EXIT_FAILURE;
   }
   return EXIT_SUCCESS;

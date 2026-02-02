@@ -213,6 +213,22 @@ QPqKyberKEM QPqKyberKEM::Generate() {
   return QPqKyberKEM(std::move(secret_key), std::move(public_key));
 }
 
+QPqKyberKEM QPqKyberKEM::GenerateDeterministic() {
+  EnsureOqsRandombytesHookInstalled();
+  if (DeterministicOqsRng::CurrentInstance() == nullptr) {
+    throw std::runtime_error("deterministic Kyber keypair generation requires DeterministicOqsRng");
+  }
+  ScopedDeterministicRandombytesAllowance allow_rng;
+  KemContext ctx(kConsensusKyberId);
+  EnsureKyberSizes(ctx.get());
+  std::vector<std::uint8_t> public_key(ctx.get()->length_public_key);
+  std::vector<std::uint8_t> secret_key(ctx.get()->length_secret_key);
+  if (OQS_KEM_keypair(ctx.get(), public_key.data(), secret_key.data()) != OQS_SUCCESS) {
+    throw std::runtime_error("Failed to generate Kyber keypair");
+  }
+  return QPqKyberKEM(std::move(secret_key), std::move(public_key));
+}
+
 KyberEncapsulationResult QPqKyberKEM::Encapsulate(std::span<const std::uint8_t> peer_public_key) {
   KemContext ctx(kConsensusKyberId);
   EnsureKyberSizes(ctx.get());

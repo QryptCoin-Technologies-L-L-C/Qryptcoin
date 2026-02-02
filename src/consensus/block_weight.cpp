@@ -9,6 +9,11 @@ namespace qryptcoin::consensus {
 
 namespace {
 
+// Block weight is defined as: base_bytes * 4 + witness_bytes.
+// The base weight cap is fixed, while an elastic upper bound can be used when
+// validation rules allow larger witness payloads without increasing base
+// overhead proportionally. These limits are consensus-critical and should only
+// be changed via an explicit network upgrade.
 constexpr std::size_t kBaseBlockWeightLimit = 4'000'000;
 constexpr std::size_t kMaxBlockWeightLimit = 8'000'000;
 

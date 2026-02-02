@@ -42,6 +42,7 @@ enum class Command : std::uint16_t {
   kHeaders = 0x000D,
   kGetData = 0x000E,
   kHandshakeFinished = 0x000F,
+  kTxCommitment = 0x0010,
 };
 
 struct Message {
@@ -115,6 +116,10 @@ struct HandshakeFinished {
   crypto::Sha3_256Hash verify{};
 };
 
+struct TxCommitmentMessage {
+  crypto::Sha3_256Hash commitment{};
+};
+
 Message EncodeVersion(const VersionMessage& msg);
 bool DecodeVersion(const Message& msg, VersionMessage* out);
 Message EncodeVerAck();
@@ -141,5 +146,7 @@ Message EncodeHandshakeFinalize(const HandshakeFinalize& fin);
 bool DecodeHandshakeFinalize(const Message& msg, HandshakeFinalize* out);
 Message EncodeHandshakeFinished(const HandshakeFinished& fin);
 bool DecodeHandshakeFinished(const Message& msg, HandshakeFinished* out);
+Message EncodeTxCommitment(const TxCommitmentMessage& msg);
+bool DecodeTxCommitment(const Message& msg, TxCommitmentMessage* out);
 
 }  // namespace qryptcoin::net::messages

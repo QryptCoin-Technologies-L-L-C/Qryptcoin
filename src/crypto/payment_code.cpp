@@ -11,18 +11,29 @@ namespace qryptcoin::crypto {
 
 namespace {
 
-constexpr std::array<std::uint8_t, 6> kMagic = {'Q', 'R', 'Y', 'P', 'C', '1'};
-constexpr std::uint8_t kVersion = 0x01;
+constexpr std::array<std::uint8_t, 6> kMagicV1 = {'Q', 'R', 'Y', 'P', 'C', '1'};
+constexpr std::uint8_t kVersionV1 = 0x01;
 constexpr std::uint8_t kKdfIdSha3 = 0x01;
 
 constexpr std::size_t kOffsetMagic = 0;
-constexpr std::size_t kOffsetVersion = kOffsetMagic + kMagic.size();
+constexpr std::size_t kOffsetVersion = kOffsetMagic + kMagicV1.size();
 constexpr std::size_t kOffsetNetwork = kOffsetVersion + 1;
 constexpr std::size_t kOffsetKdf = kOffsetNetwork + 4;
 constexpr std::size_t kOffsetScan = kOffsetKdf + 1;
 constexpr std::size_t kOffsetSpend = kOffsetScan + 32;
 constexpr std::size_t kOffsetChecksum = kOffsetSpend + 32;
 static_assert(kOffsetChecksum + 4 == kPaymentCodeV1PayloadSize);
+
+constexpr std::array<std::uint8_t, 6> kMagicV2 = {'Q', 'R', 'Y', 'P', 'C', '2'};
+constexpr std::uint8_t kVersionV2 = 0x02;
+
+constexpr std::size_t kOffsetV2Magic = 0;
+constexpr std::size_t kOffsetV2Version = kOffsetV2Magic + kMagicV2.size();
+constexpr std::size_t kOffsetV2Network = kOffsetV2Version + 1;
+constexpr std::size_t kOffsetV2Scan = kOffsetV2Network + 4;
+constexpr std::size_t kOffsetV2Spend = kOffsetV2Scan + kMlkem768PublicKeyBytes;
+constexpr std::size_t kOffsetV2Checksum = kOffsetV2Spend + 32;
+static_assert(kOffsetV2Checksum + 4 == kPaymentCodeV2PayloadSize);
 
 constexpr std::string_view kBase32Alphabet = "abcdefghijklmnopqrstuvwxyz234567";
 
@@ -99,7 +110,13 @@ bool Base32DecodeLower(std::string_view text, std::vector<std::uint8_t>* out) {
       out->push_back(static_cast<std::uint8_t>((buffer >> bits) & 0xff));
     }
   }
-  return bits == 0;
+  if (bits == 0) {
+    return true;
+  }
+  // RFC 4648 base32 without padding: allow leftover bits as long as they
+  // are zero (canonical zero padding).
+  const std::uint32_t mask = (static_cast<std::uint32_t>(1u) << bits) - 1u;
+  return (buffer & mask) == 0u;
 }
 
 std::uint32_t ReadUint32LE(std::span<const std::uint8_t> data) {
@@ -119,8 +136,8 @@ void WriteUint32LE(std::uint32_t value, std::uint8_t* out) {
 std::array<std::uint8_t, kPaymentCodeV1PayloadSize> SerializePaymentCodeV1(
     const PaymentCodeV1& code) {
   std::array<std::uint8_t, kPaymentCodeV1PayloadSize> payload{};
-  std::copy(kMagic.begin(), kMagic.end(), payload.begin() + kOffsetMagic);
-  payload[kOffsetVersion] = kVersion;
+  std::copy(kMagicV1.begin(), kMagicV1.end(), payload.begin() + kOffsetMagic);
+  payload[kOffsetVersion] = kVersionV1;
   WriteUint32LE(code.network_id, payload.data() + kOffsetNetwork);
   payload[kOffsetKdf] = code.kdf_id;
   std::copy(code.scan_pubkey.begin(), code.scan_pubkey.end(), payload.begin() + kOffsetScan);
@@ -144,11 +161,11 @@ bool ParsePaymentCodeV1(std::span<const std::uint8_t> payload, PaymentCodeV1* ou
     if (error) *error = "invalid payload length";
     return false;
   }
-  if (!std::equal(kMagic.begin(), kMagic.end(), payload.begin() + kOffsetMagic)) {
+  if (!std::equal(kMagicV1.begin(), kMagicV1.end(), payload.begin() + kOffsetMagic)) {
     if (error) *error = "invalid magic";
     return false;
   }
-  if (payload[kOffsetVersion] != kVersion) {
+  if (payload[kOffsetVersion] != kVersionV1) {
     if (error) *error = "unsupported version";
     return false;
   }
@@ -168,6 +185,55 @@ bool ParsePaymentCodeV1(std::span<const std::uint8_t> payload, PaymentCodeV1* ou
   std::copy(payload.begin() + kOffsetScan, payload.begin() + kOffsetScan + 32,
             out->scan_pubkey.begin());
   std::copy(payload.begin() + kOffsetSpend, payload.begin() + kOffsetSpend + 32,
+            out->spend_root_commitment.begin());
+  return true;
+}
+
+std::array<std::uint8_t, kPaymentCodeV2PayloadSize> SerializePaymentCodeV2(
+    const PaymentCodeV2& code) {
+  std::array<std::uint8_t, kPaymentCodeV2PayloadSize> payload{};
+  std::copy(kMagicV2.begin(), kMagicV2.end(), payload.begin() + kOffsetV2Magic);
+  payload[kOffsetV2Version] = kVersionV2;
+  WriteUint32LE(code.network_id, payload.data() + kOffsetV2Network);
+  std::copy(code.scan_pubkey.begin(), code.scan_pubkey.end(), payload.begin() + kOffsetV2Scan);
+  std::copy(code.spend_root_commitment.begin(), code.spend_root_commitment.end(),
+            payload.begin() + kOffsetV2Spend);
+  const auto digest = Sha3_256(std::span<const std::uint8_t>(payload.data(), kOffsetV2Checksum));
+  std::copy(digest.begin(), digest.begin() + 4, payload.begin() + kOffsetV2Checksum);
+  return payload;
+}
+
+bool ParsePaymentCodeV2(std::span<const std::uint8_t> payload, PaymentCodeV2* out,
+                        std::string* error) {
+  if (error) {
+    error->clear();
+  }
+  if (!out) {
+    if (error) *error = "invalid output pointer";
+    return false;
+  }
+  if (payload.size() != kPaymentCodeV2PayloadSize) {
+    if (error) *error = "invalid payload length";
+    return false;
+  }
+  if (!std::equal(kMagicV2.begin(), kMagicV2.end(), payload.begin() + kOffsetV2Magic)) {
+    if (error) *error = "invalid magic";
+    return false;
+  }
+  if (payload[kOffsetV2Version] != kVersionV2) {
+    if (error) *error = "unsupported version";
+    return false;
+  }
+  const auto digest = Sha3_256(payload.subspan(0, kOffsetV2Checksum));
+  if (!std::equal(digest.begin(), digest.begin() + 4, payload.begin() + kOffsetV2Checksum)) {
+    if (error) *error = "checksum mismatch";
+    return false;
+  }
+  out->network_id = ReadUint32LE(payload.subspan(kOffsetV2Network, 4));
+  std::copy(payload.begin() + kOffsetV2Scan,
+            payload.begin() + kOffsetV2Scan + kMlkem768PublicKeyBytes,
+            out->scan_pubkey.begin());
+  std::copy(payload.begin() + kOffsetV2Spend, payload.begin() + kOffsetV2Spend + 32,
             out->spend_root_commitment.begin());
   return true;
 }
@@ -227,6 +293,62 @@ bool DecodePaymentCodeV1(std::string_view text, std::string_view expected_networ
   PaymentCodeV1 parsed{};
   std::string parse_error;
   if (!ParsePaymentCodeV1(decoded, &parsed, &parse_error)) {
+    if (error) *error = parse_error.empty() ? "invalid payment code payload" : parse_error;
+    return false;
+  }
+  *out = parsed;
+  return true;
+}
+
+std::string EncodePaymentCodeV2(const PaymentCodeV2& code, std::string_view network_hrp) {
+  const auto payload = SerializePaymentCodeV2(code);
+  std::string out = PaymentCodeHrp(network_hrp);
+  out.push_back('1');
+  out += Base32EncodeLower(payload);
+  return out;
+}
+
+bool DecodePaymentCodeV2(std::string_view text, std::string_view expected_network_hrp,
+                         PaymentCodeV2* out, std::string* error) {
+  if (error) {
+    error->clear();
+  }
+  if (!out) {
+    if (error) *error = "invalid output pointer";
+    return false;
+  }
+  if (text.size() < 16) {
+    if (error) *error = "payment code too short";
+    return false;
+  }
+  if (!IsAllLowercaseAscii(text)) {
+    if (error) *error = "payment code must be lowercase ASCII";
+    return false;
+  }
+  const auto sep = text.find('1');
+  if (sep == std::string_view::npos || sep == 0 || sep + 1 >= text.size()) {
+    if (error) *error = "missing separator";
+    return false;
+  }
+  const auto hrp = text.substr(0, sep);
+  const auto expected_hrp = PaymentCodeHrp(expected_network_hrp);
+  if (!expected_network_hrp.empty() && hrp != expected_hrp) {
+    if (error) *error = "network prefix mismatch";
+    return false;
+  }
+  const auto data = text.substr(sep + 1);
+  std::vector<std::uint8_t> decoded;
+  if (!Base32DecodeLower(data, &decoded)) {
+    if (error) *error = "invalid base32 payload";
+    return false;
+  }
+  if (decoded.size() != kPaymentCodeV2PayloadSize) {
+    if (error) *error = "invalid decoded payload size";
+    return false;
+  }
+  PaymentCodeV2 parsed{};
+  std::string parse_error;
+  if (!ParsePaymentCodeV2(decoded, &parsed, &parse_error)) {
     if (error) *error = parse_error.empty() ? "invalid payment code payload" : parse_error;
     return false;
   }

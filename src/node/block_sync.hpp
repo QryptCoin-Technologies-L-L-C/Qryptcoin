@@ -63,6 +63,8 @@ class BlockSyncManager {
 
   using TransactionHandler =
       std::function<bool(const primitives::CTransaction&, std::string* reject_reason)>;
+  using TxCommitmentHandler =
+      std::function<void(const primitives::Hash256& commitment, std::uint64_t peer_id)>;
   using HasTransactionFn = std::function<bool(const primitives::Hash256&)>;
   using GetTransactionBytesFn =
       std::function<bool(const primitives::Hash256&, std::vector<std::uint8_t>*)>;
@@ -92,6 +94,7 @@ class BlockSyncManager {
   // discovery. All callbacks are optional; when unset, the
   // corresponding functionality is disabled.
   void SetTransactionHandler(TransactionHandler handler);
+  void SetTxCommitmentHandler(TxCommitmentHandler handler);
   void SetTransactionInventoryPolicy(HasTransactionFn has_tx,
                                      GetTransactionBytesFn get_tx_bytes);
   void SetBlockConnectedHandler(BlockConnectedHandler handler);
@@ -155,6 +158,8 @@ class BlockSyncManager {
                    const net::messages::BlockMessage& block);
   void HandleTransaction(const net::PeerManager::PeerInfo& info,
                          const net::messages::Message& message);
+  void HandleTxCommitment(const net::PeerManager::PeerInfo& info,
+                          const net::messages::Message& message);
   void SendGetHeaders(const net::PeerManager::PeerInfo& info,
                       const std::shared_ptr<net::PeerSession>& session);
   void RequestNextBlock(const net::PeerManager::PeerInfo& info,
@@ -260,6 +265,7 @@ class BlockSyncManager {
   std::atomic<bool> header_backpressure_active_{false};
 
   TransactionHandler on_transaction_received_;
+  TxCommitmentHandler on_tx_commitment_received_;
   BlockConnectedHandler on_block_connected_;
   HasTransactionFn has_transaction_;
   GetTransactionBytesFn get_transaction_bytes_;

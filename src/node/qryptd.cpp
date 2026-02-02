@@ -1275,6 +1275,11 @@ bool AppInitMain(Options opts, NodeContext* node, qryptcoin::net::AddrManager* a
                                         std::string* reject_reason) {
         return server->SubmitTransactionFromNetwork(tx, reject_reason);
       });
+  node->sync_manager->SetTxCommitmentHandler(
+      [server = node->rpc_server.get()](const qryptcoin::primitives::Hash256& commitment,
+                                        std::uint64_t peer_id) {
+        server->NotifyTransactionCommitmentFromNetwork(commitment, peer_id);
+      });
   node->sync_manager->SetTransactionInventoryPolicy(
       [server = node->rpc_server.get()](const qryptcoin::primitives::Hash256& txid) {
         return server->HasMempoolTransaction(txid);

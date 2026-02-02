@@ -485,7 +485,11 @@ void Serve(const Options& opts) {
       nlohmann::json health = {
           {"mode", "http-insecure"},
           {"version", "1"},
-          {"allowed_methods", nlohmann::json::array({"validatepaymentcode", "resolvepaymentcode"})},
+          {"allowed_methods",
+           nlohmann::json::array({"validatepaymentcode",
+                                 "resolvepaymentcode",
+                                 "registerpaymentcode",
+                                 "resolvepaymentcodeshort"})},
       };
       const auto body = health.dump();
       SendHttpResponse(client, 200, body);
@@ -507,7 +511,8 @@ void Serve(const Options& opts) {
       continue;
     }
     const std::string method = request.value("method", std::string{});
-    if (method != "resolvepaymentcode" && method != "validatepaymentcode") {
+    if (method != "resolvepaymentcode" && method != "validatepaymentcode" &&
+        method != "registerpaymentcode" && method != "resolvepaymentcodeshort") {
       SendHttpResponse(client, 200,
                        R"({"jsonrpc":"2.0","error":{"code":-32601,"message":"unknown method"}})");
       continue;

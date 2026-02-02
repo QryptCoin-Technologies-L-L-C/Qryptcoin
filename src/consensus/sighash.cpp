@@ -104,5 +104,29 @@ std::array<std::uint8_t, 32> ComputeSighash(const primitives::CTransaction& tx,
   return crypto::Sha3_256(preimage);
 }
 
+std::array<std::uint8_t, 32> ComputeP2QHSignatureMessage(
+    const std::array<std::uint8_t, 32>& base_sighash,
+    std::span<const primitives::WitnessStackItem> witness_stack) {
+  // Legacy P2QH spends sign exactly the base sighash.
+  if (witness_stack.size() <= 2) {
+    return base_sighash;
+  }
+
+  constexpr std::string_view kWitnessTag = "QRY-SIGHASH-WITNESS-V1";
+  std::vector<std::uint8_t> preimage;
+  preimage.reserve(kWitnessTag.size() + base_sighash.size() + 64);
+  preimage.insert(preimage.end(), kWitnessTag.begin(), kWitnessTag.end());
+  preimage.insert(preimage.end(), base_sighash.begin(), base_sighash.end());
+  const std::uint64_t extension_items =
+      static_cast<std::uint64_t>(witness_stack.size() - 2);
+  WriteVarInt(&preimage, extension_items);
+  for (std::size_t i = 2; i < witness_stack.size(); ++i) {
+    const auto& item = witness_stack[i].data;
+    WriteVarInt(&preimage, static_cast<std::uint64_t>(item.size()));
+    preimage.insert(preimage.end(), item.begin(), item.end());
+  }
+  return crypto::Sha3_256(preimage);
+}
+
 }  // namespace qryptcoin::consensus
 

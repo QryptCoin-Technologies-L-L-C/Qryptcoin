@@ -51,10 +51,12 @@ bool VerifyP2QHWitness(const ScriptPubKey& script,
     if (error) *error = "descriptor commitment mismatch";
     return false;
   }
-  // Dilithium-only policy: witnesses must contain exactly one PQ
-  // signature following the descriptor reveal.
-  if (witness_stack.size() != 2) {
-    if (error) *error = "unexpected witness stack size";
+  // Dilithium-only policy: witnesses must contain at least one PQ
+  // signature following the descriptor reveal. Additional witness
+  // items are allowed for future extensions, but must be committed
+  // by the signature digest (enforced at the consensus layer).
+  if (witness_stack.size() < 2) {
+    if (error) *error = "witness stack too small";
     return false;
   }
   const auto& sig = witness_stack[1].data;
