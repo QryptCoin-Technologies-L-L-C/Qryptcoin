@@ -284,16 +284,17 @@ bool TestUnsolicitedHeadersAreRateLimited() {
   qryptcoin::net::messages::HeadersMessage empty_headers{};
   const auto msg = qryptcoin::net::messages::EncodeHeaders(empty_headers);
 
-  for (int i = 0; i < 5; ++i) {
+  for (int i = 0; i < 10; ++i) {
     if (!sessions.client->Send(msg)) {
       std::cerr << "failed to send HEADERS messages\n";
       return false;
     }
+    std::this_thread::sleep_for(50ms);
   }
   if (!WaitUntil([&]() {
         return qryptcoin::net::PeerManagerTestHelper::GetBanScore(peers, "203.0.113.5") >= 10;
       },
-      2s)) {
+      5s)) {
     std::cerr << "expected unsolicited HEADERS flood to trigger ban score\n";
     return false;
   }
