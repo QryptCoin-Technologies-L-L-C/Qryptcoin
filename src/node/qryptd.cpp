@@ -891,9 +891,26 @@ Options ParseOptions(int argc, char** argv) {
     opts.p2p_port = qryptcoin::config::GetNetworkConfig().listen_port;
   }
   if (opts.data_dir.empty()) {
-    auto base =
-        std::filesystem::path("data") / std::string(qryptcoin::config::NetworkName(net_type));
-      opts.data_dir = base.string();
+    // Use platform-appropriate default data directory
+    std::filesystem::path base;
+#ifdef _WIN32
+    // Windows: Use %APPDATA%\QryptCoin (Roaming) for blockchain data
+    if (const char* appdata = std::getenv("APPDATA")) {
+      base = std::filesystem::path(appdata) / "QryptCoin" / std::string(qryptcoin::config::NetworkName(net_type));
+    } else {
+      base = std::filesystem::path("data") / std::string(qryptcoin::config::NetworkName(net_type));
+    }
+#else
+    // Unix: Use ~/.qryptcoin or $XDG_DATA_HOME/qryptcoin
+    if (const char* xdg_data = std::getenv("XDG_DATA_HOME")) {
+      base = std::filesystem::path(xdg_data) / "qryptcoin" / std::string(qryptcoin::config::NetworkName(net_type));
+    } else if (const char* home = std::getenv("HOME")) {
+      base = std::filesystem::path(home) / ".qryptcoin" / std::string(qryptcoin::config::NetworkName(net_type));
+    } else {
+      base = std::filesystem::path("data") / std::string(qryptcoin::config::NetworkName(net_type));
+    }
+#endif
+    opts.data_dir = base.string();
   }
   std::filesystem::path data_root(opts.data_dir);
   if (opts.wallet_path.empty()) {

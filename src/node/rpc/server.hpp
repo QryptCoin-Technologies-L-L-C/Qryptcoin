@@ -88,6 +88,7 @@ class RpcServer {
   nlohmann::json HandleListAddresses() const;
   nlohmann::json HandleForgetAddresses(const nlohmann::json& params);
   nlohmann::json HandlePurgeUtxos();
+  nlohmann::json HandleResyncWallet(const nlohmann::json& params);
   nlohmann::json HandleImportAddress(const nlohmann::json& params);
   nlohmann::json HandleListWatchOnly() const;
   nlohmann::json HandleRemoveWatchOnly(const nlohmann::json& params);

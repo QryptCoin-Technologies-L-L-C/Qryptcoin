@@ -478,7 +478,7 @@ bool IsWalletMethod(const std::string& method) {
       "listtransactions",  "listutxos",        "listaddresses",
       "forgetaddresses",   "importaddress",    "listwatchonly",
       "removewatchonly",   "getpqinfo",        "createwallet",
-      "loadwallet",
+      "loadwallet",        "purgeutxos",       "resyncwallet",
       "backupwallet",      "encryptwallet",    "walletlock",
       "walletpassphrase"};
   return kWalletMethods.find(method) != kWalletMethods.end();
@@ -713,6 +713,8 @@ nlohmann::json RpcServer::Handle(const nlohmann::json& request) {
       response["result"] = HandleForgetAddresses(params);
     } else if (method == "purgeutxos") {
       response["result"] = HandlePurgeUtxos();
+    } else if (method == "resyncwallet") {
+      response["result"] = HandleResyncWallet(params);
     } else if (method == "importaddress") {
       response["result"] = HandleImportAddress(params);
     } else if (method == "listwatchonly") {
@@ -1684,6 +1686,32 @@ nlohmann::json RpcServer::HandlePurgeUtxos() {
   result["purged_utxos"] = purged_count;
   result["status"] = "success";
   result["message"] = "UTXO cache cleared. Run a wallet rescan to rebuild from chain state.";
+  return result;
+}
+
+nlohmann::json RpcServer::HandleResyncWallet(const nlohmann::json& params) {
+  auto& wallet = WalletOrThrow();
+  std::size_t start_height = 0;
+  if (params.contains("start_height")) {
+    try {
+      const auto raw = params.at("start_height").get<std::int64_t>();
+      if (raw > 0) {
+        start_height = static_cast<std::size_t>(raw);
+      }
+    } catch (...) {
+      start_height = 0;
+    }
+  }
+
+  const std::size_t purged_count = wallet.PurgeUtxos();
+  wallet.Save();
+  RescanWallet(start_height, /*force_start_height=*/true);
+
+  nlohmann::json result;
+  result["purged_utxos"] = purged_count;
+  result["rescan_start_height"] = start_height;
+  result["status"] = "success";
+  result["message"] = "Wallet UTXO set rebuilt from chain state.";
   return result;
 }
 
@@ -4074,7 +4102,14 @@ void RpcServer::IndexWalletOutputs(const primitives::CBlock& block, bool save_wa
     primitives::Amount fee_miks = 0;
     if (!is_coinbase) {
       (void)chain_.GetTxFee(txid, &fee_miks);
+      // Process inputs to mark spent UTXOs
+      for (const auto& vin : tx.vin) {
+        if (wallet.MarkUtxoSpent(vin.prevout)) {
+          changed = true;
+        }
+      }
     }
+    // Process outputs to track new UTXOs
     for (std::size_t i = 0; i < tx.vout.size(); ++i) {
       if (wallet.MaybeTrackOutput(txid, i, tx.vout[i], is_coinbase, fee_miks)) {
         changed = true;

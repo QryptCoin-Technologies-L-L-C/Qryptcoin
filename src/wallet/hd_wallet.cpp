@@ -1210,6 +1210,22 @@ bool HDWallet::MaybeTrackStealthTransaction(const primitives::Hash256& txid,
   return changed;
 }
 
+bool HDWallet::MarkUtxoSpent(const primitives::COutPoint& outpoint) {
+  for (auto& utxo : utxos_) {
+    if (utxo.outpoint.txid == outpoint.txid && utxo.outpoint.index == outpoint.index) {
+      if (!utxo.spent) {
+        utxo.spent = true;
+        if (!utxo.watch_only) {
+          BurnKeyIndex(utxo.key_index);
+        }
+        return true;
+      }
+      return false;  // Already spent
+    }
+  }
+  return false;  // Not found
+}
+
 HDWallet::KeyMaterial HDWallet::DeriveKeyMaterial(std::uint32_t index,
                                                   crypto::SignatureAlgorithm /*algorithm*/) const {
   KeyMaterial material;
