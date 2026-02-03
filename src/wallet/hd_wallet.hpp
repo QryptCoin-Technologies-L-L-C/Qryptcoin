@@ -157,6 +157,9 @@ class HDWallet {
                                     const primitives::CTransaction& tx,
                                     bool is_coinbase,
                                     primitives::Amount tx_fee_miks = 0);
+  // Mark a UTXO as spent given its outpoint. Used during rescan to process
+  // transaction inputs. Returns true if the UTXO was found and marked spent.
+  bool MarkUtxoSpent(const primitives::COutPoint& outpoint);
   std::optional<CreatedTransaction> CreateTransaction(
       const std::vector<std::pair<std::string, primitives::Amount>>& outputs,
       primitives::Amount fee_rate, std::string* error);
