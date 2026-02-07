@@ -241,9 +241,12 @@ bool TestRequestedHeadersNotRateLimited() {
     }
   }
 
-  sessions.client->Close();
-  sessions.server->Close();
+  // Signal stop BEFORE closing sessions so PeerLoop sees the stop token and
+  // skips spawning a detached disconnect thread that could race with the
+  // destruction of stack-local PeerManager.
   loop_thread.request_stop();
+  sessions.server->Close();
+  sessions.client->Close();
   loop_thread.join();
 
   const int ban_score = qryptcoin::net::PeerManagerTestHelper::GetBanScore(peers, "203.0.113.5");
@@ -299,9 +302,12 @@ bool TestUnsolicitedHeadersAreRateLimited() {
     return false;
   }
 
-  sessions.client->Close();
-  sessions.server->Close();
+  // Signal stop BEFORE closing sessions so PeerLoop sees the stop token and
+  // skips spawning a detached disconnect thread that could race with the
+  // destruction of stack-local PeerManager.
   loop_thread.request_stop();
+  sessions.server->Close();
+  sessions.client->Close();
   loop_thread.join();
 
   const int ban_score = qryptcoin::net::PeerManagerTestHelper::GetBanScore(peers, "203.0.113.5");

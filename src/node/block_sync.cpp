@@ -505,7 +505,13 @@ void BlockSyncManager::PeerLoop(std::stop_token stop, net::PeerManager::PeerInfo
     }
     DispatchMessage(info, session, message);
   }
-  std::thread([this, id = info.id]() { peers_.DisconnectPeer(id); }).detach();
+  // Only disconnect asynchronously when the loop exits due to a genuine peer
+  // failure (Receive returned false).  When the stop token is set (graceful
+  // shutdown or test teardown) the owning code is responsible for cleanup;
+  // spawning a detached thread here would race with object destruction.
+  if (!stop.stop_requested()) {
+    std::thread([this, id = info.id]() { peers_.DisconnectPeer(id); }).detach();
+  }
 }
 
 void BlockSyncManager::DispatchMessage(const net::PeerManager::PeerInfo& info,
