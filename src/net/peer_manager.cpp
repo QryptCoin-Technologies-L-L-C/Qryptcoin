@@ -455,6 +455,13 @@ bool PeerManager::HasCapacityForAddressLocked(bool inbound, const std::string& a
   if (IsAddressBannedLocked(address)) {
     return false;
   }
+  // Prevent multiple outbound connections to the exact same host.
+  // Without this guard a single seed returning the same IP fills every
+  // outbound slot with duplicate connections, leaving the node unable
+  // to learn about the rest of the network.
+  if (!inbound && IsAlreadyConnectedOutboundLocked(address)) {
+    return false;
+  }
   // Enforce a simple per-subnet cap so that a single /24 cannot dominate
   // the connection table.
   const std::string key = SubnetKey(address);
@@ -468,6 +475,53 @@ bool PeerManager::HasCapacityForAddressLocked(bool inbound, const std::string& a
     }
   }
   return count < kMaxPeersPerSubnet;
+}
+
+bool PeerManager::IsAlreadyConnectedOutboundLocked(const std::string& address) const {
+  const std::string host = ExtractHost(address);
+  for (const auto& peer : peers_) {
+    if (peer.info.inbound) {
+      continue;
+    }
+    if (ExtractHost(peer.info.address) == host) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::unordered_set<std::string> PeerManager::GetConnectedOutboundHosts() const {
+  std::unordered_set<std::string> hosts;
+  std::lock_guard<std::mutex> lock(peers_mutex_);
+  for (const auto& peer : peers_) {
+    if (!peer.info.inbound) {
+      hosts.insert(ExtractHost(peer.info.address));
+    }
+  }
+  return hosts;
+}
+
+std::uint64_t PeerManager::EvictStalestOutboundPeer() {
+  std::uint64_t victim_id = 0;
+  {
+    std::lock_guard<std::mutex> lock(peers_mutex_);
+    const auto now = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::duration longest_idle{};
+    for (const auto& entry : peers_) {
+      if (entry.info.inbound || !entry.session) {
+        continue;
+      }
+      const auto idle = now - entry.session->LastActivity();
+      if (idle > longest_idle) {
+        longest_idle = idle;
+        victim_id = entry.info.id;
+      }
+    }
+  }
+  if (victim_id != 0) {
+    DisconnectPeer(victim_id);
+  }
+  return victim_id;
 }
 
 bool PeerManager::IsAddressBannedLocked(const std::string& address) const {

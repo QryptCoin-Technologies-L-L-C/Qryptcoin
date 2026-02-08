@@ -5,6 +5,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 
 #include "net/addr_manager.hpp"
 #include "nlohmann/json.hpp"
@@ -102,6 +103,34 @@ int main() {
     if (!selected || selected->host != "203.0.113.5" || selected->port != 9375) {
       std::cerr << "unexpected selection after reload\n";
       return 1;
+    }
+
+    // Test: Select() with exclude_hosts skips already-connected IPs.
+    {
+      AddrManager excl_mgr;
+      excl_mgr.Add("198.51.100.1", 9375, false);
+      excl_mgr.Add("198.51.100.2", 9375, false);
+
+      // Excluding the only two hosts should return nullopt.
+      std::unordered_set<std::string> exclude_both{"198.51.100.1", "198.51.100.2"};
+      if (excl_mgr.Select(exclude_both).has_value()) {
+        std::cerr << "expected nullopt when all hosts are excluded\n";
+        return 1;
+      }
+
+      // Excluding one host should return the other.
+      std::unordered_set<std::string> exclude_one{"198.51.100.1"};
+      const auto pick = excl_mgr.Select(exclude_one);
+      if (!pick || pick->host != "198.51.100.2") {
+        std::cerr << "expected non-excluded host to be selected\n";
+        return 1;
+      }
+
+      // Empty exclude set should work normally.
+      if (!excl_mgr.Select().has_value()) {
+        std::cerr << "expected a candidate with empty exclusion set\n";
+        return 1;
+      }
     }
 
     std::error_code ec;

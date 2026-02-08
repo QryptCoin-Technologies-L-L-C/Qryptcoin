@@ -136,7 +136,8 @@ void AddrManager::MarkResult(const std::string& host, std::uint16_t port, bool s
   }
 }
 
-std::optional<AddrManager::Entry> AddrManager::Select() const {
+std::optional<AddrManager::Entry> AddrManager::Select(
+    const std::unordered_set<std::string>& exclude_hosts) const {
   std::lock_guard<std::mutex> lock(mutex_);
   if (entries_.empty()) {
     return std::nullopt;
@@ -149,6 +150,11 @@ std::optional<AddrManager::Entry> AddrManager::Select() const {
   const auto now = NowSeconds();
   for (std::size_t idx : order) {
     const Entry& entry = entries_[idx];
+    // Skip hosts that already have an active outbound connection.
+    // This prevents the same IP from consuming multiple outbound slots.
+    if (!exclude_hosts.empty() && exclude_hosts.count(entry.host)) {
+      continue;
+    }
     if (entry.attempts > kMaxConsecutiveFailures) {
       // Demote persistently failing entries while still keeping them
       // in the table so operators can inspect them via telemetry.

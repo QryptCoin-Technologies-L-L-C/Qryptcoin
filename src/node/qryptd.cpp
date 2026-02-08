@@ -1449,6 +1449,11 @@ void MaintainOutboundPeers(qryptcoin::net::PeerManager* peers,
   if (outbound >= target_outbound) {
     return;
   }
+  // Collect already-connected outbound hosts so AddrManager::Select()
+  // skips them.  This is the counterpart to the duplicate-IP guard
+  // inside PeerManager::HasCapacityForAddressLocked() — together they
+  // ensure every outbound slot connects to a distinct IP.
+  const auto connected_hosts = peers->GetConnectedOutboundHosts();
   constexpr std::size_t kMaxOutboundDialsPerTick = 2;
   const std::size_t needed = target_outbound - outbound;
   const std::size_t attempts = std::min<std::size_t>(needed, kMaxOutboundDialsPerTick);
@@ -1456,7 +1461,7 @@ void MaintainOutboundPeers(qryptcoin::net::PeerManager* peers,
     if (ShutdownRequested()) {
       return;
     }
-    auto candidate = addrman->Select();
+    auto candidate = addrman->Select(connected_hosts);
     if (!candidate) {
       break;
     }
@@ -1494,7 +1499,8 @@ void MaybeRunSeedLoop(NodeContext& node, qryptcoin::net::AddrManager* addrman,
   // Prefer cached peers when there are still dialable candidates; the seed
   // loop is a bootstrap/fallback when we have no outbound peers or the address
   // table is exhausted.
-  if (outbound > 0 && addrman->Select().has_value()) {
+  const auto connected_hosts = node.peer_manager->GetConnectedOutboundHosts();
+  if (outbound > 0 && addrman->Select(connected_hosts).has_value()) {
     return;
   }
 
@@ -1552,6 +1558,16 @@ void WaitForShutdown(NodeContext& node, qryptcoin::net::AddrManager* addrman,
   using clock = std::chrono::steady_clock;
   constexpr auto kPeersSaveInterval = std::chrono::seconds(60);
   auto next_peers_save = clock::now() + kPeersSaveInterval;
+
+  // Stale-tip detection: if the chain tip hasn't advanced in this long,
+  // evict the most-idle outbound peer and let MaintainOutboundPeers
+  // replace it with a fresh connection.
+  constexpr auto kStaleTipThreshold = std::chrono::minutes(10);
+  constexpr auto kStaleTipCheckInterval = std::chrono::minutes(2);
+  std::size_t last_known_height = node.chain ? node.chain->Height() : 0;
+  auto last_height_change = clock::now();
+  auto next_stale_check = clock::now() + kStaleTipCheckInterval;
+
   while (!ShutdownRequested()) {
     if (dns_seeds) {
       dns_seeds->Tick();
@@ -1560,6 +1576,31 @@ void WaitForShutdown(NodeContext& node, qryptcoin::net::AddrManager* addrman,
                           qryptcoin::config::GetNetworkConfig().listen_port,
                           opts.target_outbound_peers);
     MaybeRunSeedLoop(node, addrman, dns_seeds, opts, &seed_state, opts.target_outbound_peers);
+
+    // Stale-tip peer rotation.
+    {
+      const auto now = clock::now();
+      if (node.chain && node.peer_manager && now >= next_stale_check) {
+        next_stale_check = now + kStaleTipCheckInterval;
+        const auto current_height = node.chain->Height();
+        if (current_height > last_known_height) {
+          last_known_height = current_height;
+          last_height_change = now;
+        } else if (now - last_height_change > kStaleTipThreshold) {
+          // Tip hasn't advanced — rotate the stalest outbound peer.
+          const auto evicted = node.peer_manager->EvictStalestOutboundPeer();
+          if (evicted != 0) {
+            std::cerr << "[qryptd] stale tip detected (height " << current_height
+                      << " unchanged for " << std::chrono::duration_cast<std::chrono::seconds>(
+                             now - last_height_change).count()
+                      << "s), evicted outbound peer " << evicted << "\n";
+            // Reset the timer so we don't spam evictions every check.
+            last_height_change = now;
+          }
+        }
+      }
+    }
+
     if (addrman && !peers_path.empty()) {
       const auto now = clock::now();
       if (now >= next_peers_save) {

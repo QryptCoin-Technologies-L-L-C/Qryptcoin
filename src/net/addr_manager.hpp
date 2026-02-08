@@ -6,6 +6,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace qryptcoin::net {
@@ -44,7 +45,11 @@ class AddrManager {
 
   // Select the next candidate for an outbound connection. Returns
   // std::nullopt when there is nothing suitable to try at the moment.
-  std::optional<Entry> Select() const;
+  // An optional set of hosts to exclude (already-connected peers) can
+  // be provided to avoid selecting addresses that already have active
+  // outbound connections.
+  std::optional<Entry> Select(
+      const std::unordered_set<std::string>& exclude_hosts = {}) const;
 
   // Persist the address table to disk in a simple JSON format.
   bool Save(const std::filesystem::path& path, std::string* error) const;

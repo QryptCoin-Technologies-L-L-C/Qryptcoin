@@ -8,6 +8,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <chrono>
 
@@ -67,6 +68,16 @@ class PeerManager {
   // (e.g. during handshake). The host component is extracted automatically.
   void AddBanScoreForAddress(const std::string& address, int score);
 
+  // Return the set of hosts that currently have outbound connections.
+  // Used by the outbound maintenance loop to avoid selecting
+  // already-connected addresses from the address manager.
+  std::unordered_set<std::string> GetConnectedOutboundHosts() const;
+
+  // Evict the outbound peer with the longest idle time to make room
+  // for a fresh connection attempt.  Returns the evicted peer's ID,
+  // or 0 if no outbound peer could be evicted.
+  std::uint64_t EvictStalestOutboundPeer();
+
  private:
   struct PeerEntry {
     PeerInfo info;
@@ -94,6 +105,10 @@ class PeerManager {
   // an existing peer if at capacity. Returns true if the connection should
   // be accepted.
   bool ShouldAcceptInboundLocked(const std::string& address);
+  // Check whether an outbound connection to this host already exists.
+  // Prevents duplicate outbound connections to the same IP.
+  bool IsAlreadyConnectedOutboundLocked(const std::string& host) const;
+
   static std::string ExtractHost(const std::string& address);
   static std::string SubnetKey(const std::string& address);
 
