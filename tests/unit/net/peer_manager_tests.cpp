@@ -114,9 +114,8 @@ bool TestInboundHandshakeThrottle() {
   const std::string address = "203.0.113.5:9375";
   const auto base = std::chrono::steady_clock::now();
 
-  // Default limits: allow a burst of 32 per host then reject within the window.
-  // (Limit was increased from 8 to 32 to handle burst traffic on seed nodes.)
-  for (int i = 0; i < 32; ++i) {
+  // Default limits: allow a burst of 4 per host then reject within the window.
+  for (int i = 0; i < 4; ++i) {
     if (!qryptcoin::net::PeerManagerTestHelper::AllowInboundBeforeHandshake(manager, address, base)) {
       std::cerr << "expected inbound attempt " << i << " to be allowed\n";
       return false;
@@ -131,6 +130,28 @@ bool TestInboundHandshakeThrottle() {
   const auto later = base + std::chrono::seconds(11);
   if (!qryptcoin::net::PeerManagerTestHelper::AllowInboundBeforeHandshake(manager, address, later)) {
     std::cerr << "expected inbound attempts to recover after throttle window\n";
+    return false;
+  }
+  return true;
+}
+
+bool TestPerHostInboundLimit() {
+  using namespace qryptcoin;
+  PeerManager manager(GetNetworkConfig());
+  for (int i = 0; i < 4; ++i) {
+    qryptcoin::net::PeerManagerTestHelper::AddFakePeer(
+        manager, static_cast<std::uint64_t>(i + 1), true,
+        std::string("203.0.113.9:") + std::to_string(9400 + i));
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (qryptcoin::net::PeerManagerTestHelper::AllowInboundBeforeHandshake(
+          manager, "203.0.113.9:9500", now)) {
+    std::cerr << "expected inbound host cap to reject fifth connection from same IP\n";
+    return false;
+  }
+  if (!qryptcoin::net::PeerManagerTestHelper::AllowInboundBeforeHandshake(
+          manager, "203.0.113.10:9500", now)) {
+    std::cerr << "expected different host to pass inbound pre-handshake checks\n";
     return false;
   }
   return true;
@@ -174,6 +195,10 @@ int main() {
     }
 
     if (!TestInboundHandshakeThrottle()) {
+      return 1;
+    }
+
+    if (!TestPerHostInboundLimit()) {
       return 1;
     }
 

@@ -17,16 +17,15 @@ namespace {
 constexpr std::size_t kDefaultMaxInboundPeers = 500;
 constexpr std::size_t kDefaultMaxOutboundPeers = 10;
 constexpr std::size_t kDefaultMaxTotalPeers = 512;
-// Per-subnet cap to avoid a single /24 dominating inbound slots.
-// Increased to allow more peers from shared hosting/cloud providers.
-constexpr std::size_t kMaxPeersPerSubnet = 64;
+// Per-subnet cap to avoid a single /24 dominating connection slots.
+constexpr std::size_t kMaxPeersPerSubnet = 8;
 // Pre-handshake inbound throttling. This is applied before expensive crypto
 // (Kyber) work to reduce CPU DoS from connection floods.
-// Increased limits to handle bursts of legitimate connection attempts.
 constexpr std::chrono::seconds kInboundHandshakeThrottleWindow{10};
-constexpr std::size_t kMaxInboundHandshakesPerHostWindow = 32;
-constexpr std::size_t kMaxInboundHandshakesPerSubnetWindow = 256;
+constexpr std::size_t kMaxInboundHandshakesPerHostWindow = 4;
+constexpr std::size_t kMaxInboundHandshakesPerSubnetWindow = 16;
 constexpr std::size_t kMaxInboundThrottleEntries = 16384;
+constexpr std::size_t kMaxInboundPeersPerHost = 4;
 // Disconnect peers that have been silent longer than this.
 constexpr std::chrono::seconds kIdlePeerTimeout{120};
 constexpr std::chrono::seconds kIdleSweepInterval{15};
@@ -265,11 +264,9 @@ void PeerManager::ListenerThread() {
 
     const std::string prehandshake_address = inbound.socket().PeerAddress();
 
-    // Only reject banned addresses before handshake.
-    // We no longer drop due to capacity - we'll evict existing peers if needed.
     {
       std::lock_guard<std::mutex> lock(peers_mutex_);
-      if (IsAddressBannedLocked(prehandshake_address)) {
+      if (!AllowInboundBeforeHandshakeLocked(prehandshake_address, clock::now())) {
         inbound.socket().Close();
         continue;
       }
@@ -298,6 +295,20 @@ void PeerManager::ListenerThread() {
       // Check if we should accept (and possibly evict)
       if (IsAddressBannedLocked(address)) {
         // Banned after handshake revealed real address
+        session->Close();
+        continue;
+      }
+      const std::string host = ExtractHost(address);
+      std::size_t inbound_from_host = 0;
+      for (const auto& peer : peers_) {
+        if (!peer.info.inbound) {
+          continue;
+        }
+        if (ExtractHost(peer.info.address) == host) {
+          ++inbound_from_host;
+        }
+      }
+      if (inbound_from_host >= kMaxInboundPeersPerHost) {
         session->Close();
         continue;
       }
@@ -494,6 +505,21 @@ bool PeerManager::HasCapacityForAddressLocked(bool inbound, const std::string& a
   if (!inbound && IsAlreadyConnectedOutboundLocked(address)) {
     return false;
   }
+  const std::string host = ExtractHost(address);
+  if (inbound) {
+    std::size_t host_count = 0;
+    for (const auto& peer : peers_) {
+      if (!peer.info.inbound) {
+        continue;
+      }
+      if (ExtractHost(peer.info.address) == host) {
+        ++host_count;
+      }
+    }
+    if (host_count >= kMaxInboundPeersPerHost) {
+      return false;
+    }
+  }
   // Enforce a simple per-subnet cap so that a single /24 cannot dominate
   // the connection table.
   const std::string key = SubnetKey(address);
@@ -506,7 +532,8 @@ bool PeerManager::HasCapacityForAddressLocked(bool inbound, const std::string& a
       ++count;
     }
   }
-  return count < kMaxPeersPerSubnet;
+  const std::size_t subnet_cap = inbound ? kMaxPeersPerSubnet : (kMaxPeersPerSubnet * 2);
+  return count < subnet_cap;
 }
 
 bool PeerManager::IsAlreadyConnectedOutboundLocked(const std::string& address) const {
@@ -574,7 +601,25 @@ bool PeerManager::IsAddressBannedLocked(const std::string& address) const {
 
 bool PeerManager::AllowInboundBeforeHandshakeLocked(const std::string& address,
                                                     std::chrono::steady_clock::time_point now) {
-  if (!HasCapacityForAddressLocked(true, address)) {
+  if (IsAddressBannedLocked(address)) {
+    return false;
+  }
+  const std::string host = ExtractHost(address);
+  const std::string subnet = SubnetKey(address);
+  std::size_t host_count = 0;
+  std::size_t subnet_count = 0;
+  for (const auto& peer : peers_) {
+    if (!peer.info.inbound) {
+      continue;
+    }
+    if (ExtractHost(peer.info.address) == host) {
+      ++host_count;
+    }
+    if (SubnetKey(peer.info.address) == subnet) {
+      ++subnet_count;
+    }
+  }
+  if (host_count >= kMaxInboundPeersPerHost || subnet_count >= kMaxPeersPerSubnet) {
     return false;
   }
 
@@ -598,11 +643,9 @@ bool PeerManager::AllowInboundBeforeHandshakeLocked(const std::string& address,
     return true;
   };
 
-  const std::string host = ExtractHost(address);
   if (!check_window(&inbound_host_throttle_, host, kMaxInboundHandshakesPerHostWindow)) {
     return false;
   }
-  const std::string subnet = SubnetKey(address);
   if (!check_window(&inbound_subnet_throttle_, subnet, kMaxInboundHandshakesPerSubnetWindow)) {
     return false;
   }
@@ -659,21 +702,19 @@ std::string PeerManager::SubnetKey(const std::string& address) {
 }
 
 std::uint64_t PeerManager::EvictInboundPeerLocked() {
-  // Select the least useful inbound peer to evict.
-  // Eviction criteria (in order of preference for eviction):
-  // 1. Peers with longest idle time (no recent activity)
-  // 2. Peers from over-represented subnets
-  // 3. Newest connections (protect long-lived connections)
-
+  // Select the least useful inbound peer to evict. Prefer overrepresented
+  // hosts/subnets and peers that have been idle longest.
   const auto now = std::chrono::steady_clock::now();
   std::uint64_t best_candidate = 0;
   std::chrono::steady_clock::duration best_idle_time{};
+  std::size_t best_host_count = 0;
   std::size_t best_subnet_count = 0;
 
-  // Count peers per subnet for diversity scoring
+  std::unordered_map<std::string, std::size_t> host_counts;
   std::unordered_map<std::string, std::size_t> subnet_counts;
   for (const auto& entry : peers_) {
     if (entry.info.inbound) {
+      ++host_counts[ExtractHost(entry.info.address)];
       const std::string subnet = SubnetKey(entry.info.address);
       ++subnet_counts[subnet];
     }
@@ -681,34 +722,37 @@ std::uint64_t PeerManager::EvictInboundPeerLocked() {
 
   for (const auto& entry : peers_) {
     if (!entry.info.inbound) {
-      continue;  // Only evict inbound peers
+      continue;
     }
     if (!entry.session) {
       continue;
     }
 
     const auto idle_time = now - entry.session->LastActivity();
+    const std::string host = ExtractHost(entry.info.address);
+    const std::size_t host_count = host_counts[host];
     const std::string subnet = SubnetKey(entry.info.address);
     const std::size_t subnet_count = subnet_counts[subnet];
 
-    // Prefer to evict peers that are:
-    // - More idle (longer since last activity)
-    // - From over-represented subnets
     bool is_better_candidate = false;
-
+    const bool host_over_limit = host_count > kMaxInboundPeersPerHost;
+    const bool best_host_over_limit = best_host_count > kMaxInboundPeersPerHost;
     if (best_candidate == 0) {
       is_better_candidate = true;
-    } else if (subnet_count > best_subnet_count + 2) {
-      // Strongly prefer evicting from over-represented subnets
+    } else if (host_over_limit != best_host_over_limit) {
+      is_better_candidate = host_over_limit;
+    } else if (host_count > best_host_count) {
       is_better_candidate = true;
-    } else if (subnet_count >= best_subnet_count && idle_time > best_idle_time) {
-      // Among similar subnet representation, prefer more idle peers
+    } else if (subnet_count > best_subnet_count) {
+      is_better_candidate = true;
+    } else if (subnet_count == best_subnet_count && idle_time > best_idle_time) {
       is_better_candidate = true;
     }
 
     if (is_better_candidate) {
       best_candidate = entry.info.id;
       best_idle_time = idle_time;
+      best_host_count = host_count;
       best_subnet_count = subnet_count;
     }
   }
