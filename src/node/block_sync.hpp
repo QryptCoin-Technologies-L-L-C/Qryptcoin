@@ -13,6 +13,7 @@
 #include <vector>
 #include <chrono>
 
+#include "net/addr_manager.hpp"
 #include "net/peer_manager.hpp"
 #include "node/chain_state.hpp"
 #include "primitives/transaction.hpp"
@@ -70,7 +71,7 @@ class BlockSyncManager {
       std::function<bool(const primitives::Hash256&, std::vector<std::uint8_t>*)>;
   using BlockConnectedHandler =
       std::function<void(const primitives::CBlock&, std::uint32_t height)>;
-  using AddressObserver = std::function<void(const std::string&)>;
+  using AddressObserver = std::function<void(const std::string&, std::uint16_t)>;
 
   BlockSyncManager(ChainState& chain, net::PeerManager& peers);
   ~BlockSyncManager();
@@ -99,6 +100,7 @@ class BlockSyncManager {
                                      GetTransactionBytesFn get_tx_bytes);
   void SetBlockConnectedHandler(BlockConnectedHandler handler);
   void SetAddressObserver(AddressObserver observer);
+  void SetAddrManager(net::AddrManager* am);
 
  private:
   struct Hash256Hasher {
@@ -131,6 +133,7 @@ class BlockSyncManager {
     // within a short window. Unsolicited headers are ignored and scored
     // as misbehavior to avoid header-flood memory DoS.
     std::chrono::steady_clock::time_point headers_expected_until{};
+    bool getaddr_responded_{false};
   };
 
   void OnPeerConnected(const net::PeerManager::PeerInfo& info,
@@ -161,6 +164,11 @@ class BlockSyncManager {
                          const net::messages::Message& message);
   void HandleTxCommitment(const net::PeerManager::PeerInfo& info,
                           const net::messages::Message& message);
+  void HandleGetAddr(const net::PeerManager::PeerInfo& info,
+                     const std::shared_ptr<net::PeerSession>& session);
+  void HandleAddr(const net::PeerManager::PeerInfo& info,
+                  const std::shared_ptr<net::PeerSession>& session,
+                  const net::messages::AddrMessage& addr);
   void SendGetHeaders(const net::PeerManager::PeerInfo& info,
                       const std::shared_ptr<net::PeerSession>& session);
   void RequestNextBlock(const net::PeerManager::PeerInfo& info,
@@ -271,6 +279,7 @@ class BlockSyncManager {
   HasTransactionFn has_transaction_;
   GetTransactionBytesFn get_transaction_bytes_;
   AddressObserver on_address_seen_;
+  net::AddrManager* addrman_{nullptr};
 
   // Background watcher for stalled block downloads.
   std::jthread stall_thread_;

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <iostream>
 #include <limits>
+#include <random>
 #include <span>
 
 #include "consensus/block_hash.hpp"
@@ -338,6 +339,11 @@ void BlockSyncManager::SetAddressObserver(AddressObserver observer) {
   on_address_seen_ = std::move(observer);
 }
 
+void BlockSyncManager::SetAddrManager(net::AddrManager* am) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  addrman_ = am;
+}
+
 void BlockSyncManager::OnPeerConnected(const net::PeerManager::PeerInfo& info,
                                        const std::shared_ptr<net::PeerSession>& session) {
   if (!running_) {
@@ -346,7 +352,7 @@ void BlockSyncManager::OnPeerConnected(const net::PeerManager::PeerInfo& info,
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (on_address_seen_) {
-      on_address_seen_(info.address);
+      on_address_seen_(info.address, 0);
     }
   }
   PeerWorker worker;
@@ -361,6 +367,7 @@ void BlockSyncManager::OnPeerConnected(const net::PeerManager::PeerInfo& info,
   }
   SendGetHeaders(info, session);
   RequestNextBlock(info, session);
+  session->Send(net::messages::EncodeGetAddr());
 }
 
 void BlockSyncManager::OnPeerDisconnected(const net::PeerManager::PeerInfo& info) {
@@ -426,6 +433,7 @@ void BlockSyncManager::PeerLoop(std::stop_token stop, net::PeerManager::PeerInfo
   std::size_t headers_count = 0;
   std::size_t block_count = 0;
   std::size_t tx_count = 0;
+  std::size_t addr_count = 0;
 
   while (!stop.stop_requested()) {
     net::messages::Message message;
@@ -436,7 +444,7 @@ void BlockSyncManager::PeerLoop(std::stop_token stop, net::PeerManager::PeerInfo
     if (now - window_start >= kWindowDuration) {
       window_start = now;
       messages_in_window = 0;
-      inv_count = getdata_count = headers_count = block_count = tx_count = 0;
+      inv_count = getdata_count = headers_count = block_count = tx_count = addr_count = 0;
     }
     ++messages_in_window;
     if (messages_in_window > kMaxMessagesPerWindow) {
@@ -496,6 +504,13 @@ void BlockSyncManager::PeerLoop(std::stop_token stop, net::PeerManager::PeerInfo
       case Command::kTxCommitment:
         if (tx_limit > 0 && ++tx_count > tx_limit) {
           std::cerr << "[sync] peer " << info.id << " exceeded TX rate limit\n";
+          peers_.AddBanScore(info.id, 10);
+          return;
+        }
+        break;
+      case Command::kAddr:
+        if (++addr_count > 10) {
+          std::cerr << "[sync] peer " << info.id << " exceeded ADDR rate limit\n";
           peers_.AddBanScore(info.id, 10);
           return;
         }
@@ -580,6 +595,20 @@ void BlockSyncManager::DispatchMessage(const net::PeerManager::PeerInfo& info,
     }
     case Command::kTxCommitment: {
       HandleTxCommitment(info, message);
+      break;
+    }
+    case Command::kGetAddr: {
+      HandleGetAddr(info, session);
+      break;
+    }
+    case Command::kAddr: {
+      net::messages::AddrMessage addr;
+      if (!net::messages::DecodeAddr(message, &addr)) {
+        std::cerr << "[sync] peer " << info.id << " sent malformed ADDR payload\n";
+        peers_.AddBanScore(info.id, 10);
+        return;
+      }
+      HandleAddr(info, session, addr);
       break;
     }
     case Command::kPong:
@@ -1322,6 +1351,84 @@ void BlockSyncManager::HandleTxCommitment(const net::PeerManager::PeerInfo& info
   primitives::Hash256 commitment{};
   std::copy(commit.commitment.begin(), commit.commitment.end(), commitment.begin());
   handler_copy(commitment, info.id);
+}
+
+void BlockSyncManager::HandleGetAddr(const net::PeerManager::PeerInfo& info,
+                                     const std::shared_ptr<net::PeerSession>& session) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = peer_workers_.find(info.id);
+    if (it == peer_workers_.end()) {
+      return;
+    }
+    if (it->second.getaddr_responded_) {
+      return;
+    }
+    it->second.getaddr_responded_ = true;
+  }
+  net::AddrManager* am = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    am = addrman_;
+  }
+  if (!am) {
+    session->Send(net::messages::EncodeAddr(net::messages::AddrMessage{}));
+    return;
+  }
+  const auto entries = am->GetAddresses(1000);
+  net::messages::AddrMessage reply;
+  reply.entries.reserve(entries.size());
+  for (const auto& e : entries) {
+    reply.entries.push_back({e.host, e.port});
+  }
+  session->Send(net::messages::EncodeAddr(reply));
+}
+
+void BlockSyncManager::HandleAddr(const net::PeerManager::PeerInfo& info,
+                                  const std::shared_ptr<net::PeerSession>& /*session*/,
+                                  const net::messages::AddrMessage& addr) {
+  if (addr.entries.empty()) {
+    return;
+  }
+  AddressObserver observer_copy;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    observer_copy = on_address_seen_;
+  }
+  std::vector<net::messages::AddrEntry> relay_candidates;
+  for (const auto& entry : addr.entries) {
+    if (entry.host.empty() || entry.port == 0) {
+      continue;
+    }
+    if (observer_copy) {
+      observer_copy(entry.host, entry.port);
+    }
+    if (relay_candidates.size() < 10) {
+      relay_candidates.push_back(entry);
+    }
+  }
+  if (relay_candidates.empty()) {
+    return;
+  }
+  // Relay a subset to 1-2 random connected peers (lightweight gossip).
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<std::uint64_t> candidates;
+  for (const auto& kv : peer_workers_) {
+    if (kv.first != info.id && kv.second.session) {
+      candidates.push_back(kv.first);
+    }
+  }
+  std::shuffle(candidates.begin(), candidates.end(), std::mt19937{std::random_device{}()});
+  const std::size_t relay_to = std::min<std::size_t>(candidates.size(), 2);
+  net::messages::AddrMessage relay_msg;
+  relay_msg.entries = std::move(relay_candidates);
+  const auto encoded = net::messages::EncodeAddr(relay_msg);
+  for (std::size_t i = 0; i < relay_to; ++i) {
+    auto it = peer_workers_.find(candidates[i]);
+    if (it != peer_workers_.end() && it->second.session) {
+      it->second.session->Send(encoded);
+    }
+  }
 }
 
 void BlockSyncManager::SendGetHeaders(const net::PeerManager::PeerInfo& info,

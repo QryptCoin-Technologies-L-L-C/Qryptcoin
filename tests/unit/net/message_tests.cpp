@@ -187,5 +187,91 @@ int main() {
     return EXIT_FAILURE;
   }
 
+  // Round-trip GETADDR (empty payload).
+  {
+    auto getaddr = EncodeGetAddr();
+    if (!IsGetAddr(getaddr)) {
+      std::cerr << "IsGetAddr failed for valid GETADDR\n";
+      return EXIT_FAILURE;
+    }
+    Message fake_getaddr{Command::kGetAddr, {0x01}};
+    if (IsGetAddr(fake_getaddr)) {
+      std::cerr << "IsGetAddr accepted non-empty payload\n";
+      return EXIT_FAILURE;
+    }
+  }
+
+  // Round-trip ADDR with multiple entries.
+  {
+    AddrMessage addr_msg{};
+    addr_msg.entries.push_back({"203.0.113.1", 9375});
+    addr_msg.entries.push_back({"198.51.100.2", 18750});
+    addr_msg.entries.push_back({"10.0.0.1", 1});
+    auto encoded_addr = EncodeAddr(addr_msg);
+    AddrMessage decoded_addr{};
+    if (!DecodeAddr(encoded_addr, &decoded_addr)) {
+      std::cerr << "DecodeAddr failed\n";
+      return EXIT_FAILURE;
+    }
+    if (decoded_addr.entries.size() != 3) {
+      std::cerr << "DecodeAddr entry count mismatch\n";
+      return EXIT_FAILURE;
+    }
+    for (std::size_t i = 0; i < addr_msg.entries.size(); ++i) {
+      if (decoded_addr.entries[i].host != addr_msg.entries[i].host ||
+          decoded_addr.entries[i].port != addr_msg.entries[i].port) {
+        std::cerr << "DecodeAddr entry " << i << " mismatch\n";
+        return EXIT_FAILURE;
+      }
+    }
+  }
+
+  // DecodeAddr rejects payloads exceeding kMaxAddrEntries.
+  {
+    Message oversized{Command::kAddr, {}};
+    // Encode a varint count of kMaxAddrEntries + 1 to trigger rejection.
+    std::vector<std::uint8_t> payload;
+    // Use 3-byte varint for 1001: 0xFD followed by little-endian uint16.
+    const std::uint16_t big_count = static_cast<std::uint16_t>(kMaxAddrEntries + 1);
+    payload.push_back(0xFD);
+    payload.push_back(static_cast<std::uint8_t>(big_count & 0xFF));
+    payload.push_back(static_cast<std::uint8_t>((big_count >> 8) & 0xFF));
+    oversized.payload = payload;
+    AddrMessage oversized_decoded{};
+    if (DecodeAddr(oversized, &oversized_decoded)) {
+      std::cerr << "DecodeAddr accepted oversized count\n";
+      return EXIT_FAILURE;
+    }
+  }
+
+  // DecodeAddr rejects truncated payloads.
+  {
+    AddrMessage one_entry{};
+    one_entry.entries.push_back({"1.2.3.4", 9375});
+    auto encoded = EncodeAddr(one_entry);
+    // Truncate one byte.
+    encoded.payload.pop_back();
+    AddrMessage truncated_decoded{};
+    if (DecodeAddr(encoded, &truncated_decoded)) {
+      std::cerr << "DecodeAddr accepted truncated payload\n";
+      return EXIT_FAILURE;
+    }
+  }
+
+  // DecodeAddr with empty entries.
+  {
+    AddrMessage empty_msg{};
+    auto encoded_empty = EncodeAddr(empty_msg);
+    AddrMessage decoded_empty{};
+    if (!DecodeAddr(encoded_empty, &decoded_empty)) {
+      std::cerr << "DecodeAddr failed for empty entries\n";
+      return EXIT_FAILURE;
+    }
+    if (!decoded_empty.entries.empty()) {
+      std::cerr << "DecodeAddr non-empty result for empty input\n";
+      return EXIT_FAILURE;
+    }
+  }
+
   return EXIT_SUCCESS;
 }

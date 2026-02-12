@@ -51,6 +51,9 @@ class AddrManager {
   std::optional<Entry> Select(
       const std::unordered_set<std::string>& exclude_hosts = {}) const;
 
+  // Return up to max_count addresses suitable for sharing with peers.
+  std::vector<Entry> GetAddresses(std::size_t max_count) const;
+
   // Age-out failure counters so temporarily bad addresses can be retried.
   void DecayFailureCounts(std::uint64_t max_age_seconds = 3600);
   // Clear failure counters for every entry.

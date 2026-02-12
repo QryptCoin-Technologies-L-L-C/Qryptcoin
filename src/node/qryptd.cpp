@@ -1268,12 +1268,11 @@ bool AppInitMain(Options opts, NodeContext* node, qryptcoin::net::AddrManager* a
   node->dns_seeds = dns_seeds;
   if (addrman) {
     node->sync_manager->SetAddressObserver(
-        [addrman, port = qryptcoin::config::GetNetworkConfig().listen_port](const std::string& address) {
-          // PeerManager::PeerInfo::address already includes the remote host,
-          // so we treat it as a host string and pair it with the network
-          // listen port for future outbound attempts.
-          addrman->Add(address, port, false);
+        [addrman, default_port = qryptcoin::config::GetNetworkConfig().listen_port](
+            const std::string& host, std::uint16_t port) {
+          addrman->Add(host, port != 0 ? port : default_port, false);
         });
+    node->sync_manager->SetAddrManager(addrman);
   }
 
   node->rpc_server = std::make_unique<qryptcoin::rpc::RpcServer>(

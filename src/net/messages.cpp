@@ -450,4 +450,49 @@ bool DecodeTxCommitment(const Message& msg, TxCommitmentMessage* out) {
   return true;
 }
 
+Message EncodeGetAddr() { return Message{Command::kGetAddr, {}}; }
+
+bool IsGetAddr(const Message& msg) {
+  return msg.command == Command::kGetAddr && msg.payload.empty();
+}
+
+Message EncodeAddr(const AddrMessage& msg) {
+  Message message{Command::kAddr, {}};
+  WriteVarInt(&message.payload, msg.entries.size());
+  for (const auto& entry : msg.entries) {
+    WriteVarInt(&message.payload, entry.host.size());
+    message.payload.insert(message.payload.end(), entry.host.begin(), entry.host.end());
+    message.payload.push_back(static_cast<std::uint8_t>(entry.port & 0xFF));
+    message.payload.push_back(static_cast<std::uint8_t>((entry.port >> 8) & 0xFF));
+  }
+  return message;
+}
+
+bool DecodeAddr(const Message& msg, AddrMessage* out) {
+  if (msg.command != Command::kAddr) return false;
+  std::size_t offset = 0;
+  std::uint64_t count = 0;
+  if (!ReadVarInt(msg.payload, &offset, &count)) return false;
+  if (count > kMaxAddrEntries) return false;
+  out->entries.clear();
+  out->entries.reserve(static_cast<std::size_t>(count));
+  for (std::uint64_t i = 0; i < count; ++i) {
+    std::uint64_t host_len = 0;
+    if (!ReadVarInt(msg.payload, &offset, &host_len)) return false;
+    if (host_len > 253) return false;
+    if (!EnsureAvailable(msg.payload, offset, static_cast<std::size_t>(host_len) + 2)) {
+      return false;
+    }
+    AddrEntry entry;
+    entry.host.assign(reinterpret_cast<const char*>(&msg.payload[offset]),
+                      static_cast<std::size_t>(host_len));
+    offset += static_cast<std::size_t>(host_len);
+    entry.port = static_cast<std::uint16_t>(msg.payload[offset]) |
+                 (static_cast<std::uint16_t>(msg.payload[offset + 1]) << 8);
+    offset += 2;
+    out->entries.push_back(std::move(entry));
+  }
+  return offset == msg.payload.size();
+}
+
 }  // namespace qryptcoin::net::messages

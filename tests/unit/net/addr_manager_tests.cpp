@@ -183,6 +183,58 @@ int main() {
       }
     }
 
+    // Test: GetAddresses returns eligible entries and respects max_count.
+    {
+      AddrManager ga_mgr;
+      ga_mgr.Add("198.51.100.20", 9375, false);
+      ga_mgr.Add("198.51.100.21", 9375, false);
+      ga_mgr.Add("198.51.100.22", 9375, false);
+      // Mark one as successful.
+      ga_mgr.MarkResult("198.51.100.20", 9375, true);
+      // Mark one as failed repeatedly (demoted).
+      for (int i = 0; i < 17; ++i) {
+        ga_mgr.MarkResult("198.51.100.21", 9375, false);
+      }
+      // 198.51.100.22 is untried (last_success==0, attempts==0) - eligible.
+      // 198.51.100.20 was successful - eligible.
+      // 198.51.100.21 is demoted - excluded.
+      const auto addrs = ga_mgr.GetAddresses(100);
+      if (addrs.size() != 2) {
+        std::cerr << "GetAddresses expected 2 eligible entries, got " << addrs.size() << "\n";
+        return 1;
+      }
+      // Verify demoted entry is excluded.
+      bool found_demoted = false;
+      for (const auto& a : addrs) {
+        if (a.host == "198.51.100.21") {
+          found_demoted = true;
+        }
+      }
+      if (found_demoted) {
+        std::cerr << "GetAddresses should exclude demoted entries\n";
+        return 1;
+      }
+      // Test max_count limit.
+      const auto limited = ga_mgr.GetAddresses(1);
+      if (limited.size() != 1) {
+        std::cerr << "GetAddresses did not respect max_count\n";
+        return 1;
+      }
+    }
+
+    // Test: GetAddresses excludes entries with attempts>0 and no success.
+    {
+      AddrManager ga_mgr2;
+      ga_mgr2.Add("198.51.100.30", 9375, false);
+      ga_mgr2.MarkResult("198.51.100.30", 9375, false);
+      // This entry has attempts=1, last_success=0 — not reliable to share.
+      const auto addrs2 = ga_mgr2.GetAddresses(100);
+      if (!addrs2.empty()) {
+        std::cerr << "GetAddresses should exclude tried-but-never-successful entries\n";
+        return 1;
+      }
+    }
+
     std::error_code ec;
     std::filesystem::remove(peers_path, ec);
 

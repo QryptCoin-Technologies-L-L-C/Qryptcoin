@@ -25,6 +25,7 @@ constexpr std::uint32_t kCurrentProtocolVersion = 5;
   constexpr std::size_t kMaxGetDataEntries = 50'000;
   constexpr std::size_t kMaxLocatorHashes = 64;
   constexpr std::size_t kMaxHeadersResults = 2000;
+  constexpr std::size_t kMaxAddrEntries = 1000;
 
 enum class Command : std::uint16_t {
   kVersion = 0x0001,
@@ -43,6 +44,8 @@ enum class Command : std::uint16_t {
   kGetData = 0x000E,
   kHandshakeFinished = 0x000F,
   kTxCommitment = 0x0010,
+  kGetAddr = 0x0011,
+  kAddr = 0x0012,
 };
 
 struct Message {
@@ -121,6 +124,15 @@ struct TxCommitmentMessage {
   crypto::Sha3_256Hash commitment{};
 };
 
+struct AddrEntry {
+  std::string host;
+  std::uint16_t port{0};
+};
+
+struct AddrMessage {
+  std::vector<AddrEntry> entries;
+};
+
 Message EncodeVersion(const VersionMessage& msg);
 bool DecodeVersion(const Message& msg, VersionMessage* out);
 Message EncodeVerAck();
@@ -149,5 +161,9 @@ Message EncodeHandshakeFinished(const HandshakeFinished& fin);
 bool DecodeHandshakeFinished(const Message& msg, HandshakeFinished* out);
 Message EncodeTxCommitment(const TxCommitmentMessage& msg);
 bool DecodeTxCommitment(const Message& msg, TxCommitmentMessage* out);
+Message EncodeGetAddr();
+bool IsGetAddr(const Message& msg);
+Message EncodeAddr(const AddrMessage& msg);
+bool DecodeAddr(const Message& msg, AddrMessage* out);
 
 }  // namespace qryptcoin::net::messages

@@ -170,6 +170,26 @@ std::optional<AddrManager::Entry> AddrManager::Select(
   return std::nullopt;
 }
 
+std::vector<AddrManager::Entry> AddrManager::GetAddresses(std::size_t max_count) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<Entry> result;
+  result.reserve(std::min(max_count, entries_.size()));
+  for (const auto& entry : entries_) {
+    if (entry.attempts > kMaxConsecutiveFailures) {
+      continue;
+    }
+    if (entry.last_success == 0 && entry.attempts > 0) {
+      continue;
+    }
+    result.push_back(entry);
+  }
+  std::shuffle(result.begin(), result.end(), std::mt19937{std::random_device{}()});
+  if (result.size() > max_count) {
+    result.resize(max_count);
+  }
+  return result;
+}
+
 void AddrManager::DecayFailureCounts(std::uint64_t max_age_seconds) {
   const auto now = NowSeconds();
   std::lock_guard<std::mutex> lock(mutex_);
