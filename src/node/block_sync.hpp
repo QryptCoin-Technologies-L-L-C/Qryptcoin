@@ -157,6 +157,7 @@ class BlockSyncManager {
                    const std::shared_ptr<net::PeerSession>& session,
                    const net::messages::BlockMessage& block);
   void HandleTransaction(const net::PeerManager::PeerInfo& info,
+                         const std::shared_ptr<net::PeerSession>& session,
                          const net::messages::Message& message);
   void HandleTxCommitment(const net::PeerManager::PeerInfo& info,
                           const net::messages::Message& message);

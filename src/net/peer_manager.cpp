@@ -28,6 +28,8 @@ constexpr std::size_t kMaxInboundThrottleEntries = 16384;
 constexpr std::size_t kMaxInboundPeersPerHost = 4;
 // Disconnect peers that have been silent longer than this.
 constexpr std::chrono::seconds kIdlePeerTimeout{120};
+constexpr std::chrono::seconds kInboundUsefulActivityTimeout{600};
+constexpr std::chrono::seconds kOutboundUsefulActivityTimeout{1800};
 constexpr std::chrono::seconds kIdleSweepInterval{15};
 constexpr int kListenerBacklog = 128;
 // Simple ban scoring parameters.
@@ -357,8 +359,11 @@ void PeerManager::IdleSweeperThread() {
       const auto now = std::chrono::steady_clock::now();
       for (const auto& entry : peers_) {
         if (!entry.session) continue;
-        const auto last = entry.session->LastActivity();
-        if (now - last > kIdlePeerTimeout) {
+        const auto last_activity = entry.session->LastActivity();
+        const auto last_useful = entry.session->LastUsefulActivity();
+        const auto useful_timeout =
+            entry.info.inbound ? kInboundUsefulActivityTimeout : kOutboundUsefulActivityTimeout;
+        if (now - last_activity > kIdlePeerTimeout || now - last_useful > useful_timeout) {
           to_drop.push_back(entry.info.id);
         }
       }
@@ -707,6 +712,7 @@ std::uint64_t PeerManager::EvictInboundPeerLocked() {
   const auto now = std::chrono::steady_clock::now();
   std::uint64_t best_candidate = 0;
   std::chrono::steady_clock::duration best_idle_time{};
+  std::chrono::steady_clock::duration best_useful_idle_time{};
   std::size_t best_host_count = 0;
   std::size_t best_subnet_count = 0;
 
@@ -729,6 +735,7 @@ std::uint64_t PeerManager::EvictInboundPeerLocked() {
     }
 
     const auto idle_time = now - entry.session->LastActivity();
+    const auto useful_idle_time = now - entry.session->LastUsefulActivity();
     const std::string host = ExtractHost(entry.info.address);
     const std::size_t host_count = host_counts[host];
     const std::string subnet = SubnetKey(entry.info.address);
@@ -745,13 +752,17 @@ std::uint64_t PeerManager::EvictInboundPeerLocked() {
       is_better_candidate = true;
     } else if (subnet_count > best_subnet_count) {
       is_better_candidate = true;
-    } else if (subnet_count == best_subnet_count && idle_time > best_idle_time) {
+    } else if (subnet_count == best_subnet_count && useful_idle_time > best_useful_idle_time) {
+      is_better_candidate = true;
+    } else if (subnet_count == best_subnet_count && useful_idle_time == best_useful_idle_time &&
+               idle_time > best_idle_time) {
       is_better_candidate = true;
     }
 
     if (is_better_candidate) {
       best_candidate = entry.info.id;
       best_idle_time = idle_time;
+      best_useful_idle_time = useful_idle_time;
       best_host_count = host_count;
       best_subnet_count = subnet_count;
     }

@@ -575,7 +575,7 @@ void BlockSyncManager::DispatchMessage(const net::PeerManager::PeerInfo& info,
       break;
     }
     case Command::kTransaction: {
-      HandleTransaction(info, message);
+      HandleTransaction(info, session, message);
       break;
     }
     case Command::kTxCommitment: {
@@ -828,6 +828,9 @@ void BlockSyncManager::HandleHeaders(const net::PeerManager::PeerInfo& info,
   if (ban_score != 0) {
     peers_.AddBanScore(info.id, ban_score);
     return;
+  }
+  if (!accepted.empty() && session) {
+    session->UpdateUsefulActivity();
   }
   RequestNextBlock(info, session);
   if (accepted.size() == kMaxHeadersPerRequest) {
@@ -1088,6 +1091,9 @@ void BlockSyncManager::HandleBlock(const net::PeerManager::PeerInfo& info,
     // Unexpected block; ignore but do not immediately ban.
     return;
   }
+  if (session) {
+    session->UpdateUsefulActivity();
+  }
 
   BlockConnectedHandler block_handler;
   {
@@ -1230,6 +1236,7 @@ void BlockSyncManager::HandleBlock(const net::PeerManager::PeerInfo& info,
 }
 
 void BlockSyncManager::HandleTransaction(const net::PeerManager::PeerInfo& info,
+                                         const std::shared_ptr<net::PeerSession>& session,
                                          const net::messages::Message& message) {
   TransactionHandler handler_copy;
   {
@@ -1290,6 +1297,9 @@ void BlockSyncManager::HandleTransaction(const net::PeerManager::PeerInfo& info,
     std::lock_guard<std::mutex> lock(mutex_);
     recent_rejects_[txid] = RecentRejectEntry{std::chrono::steady_clock::now() + kRecentRejectsTtl,
                                               reject_reason};
+  }
+  if (accepted && session) {
+    session->UpdateUsefulActivity();
   }
 }
 

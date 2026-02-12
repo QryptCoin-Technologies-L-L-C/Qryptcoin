@@ -62,6 +62,7 @@ PeerSession::PeerSession(PeerSession&& other) noexcept
       peer_identity_public_key_(std::move(other.peer_identity_public_key_)),
       local_session_nonce_(other.local_session_nonce_),
       last_activity_(other.last_activity_),
+      last_useful_activity_(other.last_useful_activity_),
       last_error_(std::move(other.last_error_)) {}
 
 PeerSession& PeerSession::operator=(PeerSession&& other) noexcept {
@@ -76,6 +77,7 @@ PeerSession& PeerSession::operator=(PeerSession&& other) noexcept {
     peer_identity_public_key_ = std::move(other.peer_identity_public_key_);
     local_session_nonce_ = other.local_session_nonce_;
     last_activity_ = other.last_activity_;
+    last_useful_activity_ = other.last_useful_activity_;
     last_error_ = std::move(other.last_error_);
   }
   return *this;
