@@ -57,6 +57,7 @@ class PeerManager {
   bool DisconnectPeer(std::uint64_t peer_id);
   std::vector<PeerInfo> GetPeerInfos() const;
   NetworkStats GetStats() const;
+  std::uint64_t local_session_nonce() const noexcept { return local_session_nonce_; }
   void SetPeerConnectedHandler(PeerConnectedHandler handler);
   void SetPeerDisconnectedHandler(PeerDisconnectedHandler handler);
   // Increase the ban score for a peer. When the score for a given address
@@ -145,6 +146,7 @@ class PeerManager {
   };
   std::unordered_map<std::string, ThrottleWindow> inbound_host_throttle_;
   std::unordered_map<std::string, ThrottleWindow> inbound_subnet_throttle_;
+  std::uint64_t local_session_nonce_{0};
 
   friend class PeerManagerTestHelper;
 };

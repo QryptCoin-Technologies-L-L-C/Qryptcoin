@@ -38,6 +38,7 @@ class PeerSession {
   bool Receive(messages::Message* message);
   std::chrono::steady_clock::time_point LastActivity() const { return last_activity_; }
   void UpdateActivity() { last_activity_ = std::chrono::steady_clock::now(); }
+  void SetLocalSessionNonce(std::uint64_t nonce) noexcept { local_session_nonce_ = nonce; }
   std::string PeerAddress() const { return secure_channel_.PeerAddress(); }
   // Remote peer's long-term transport identity key (Dilithium public key),
   // populated when encrypted transport authentication is enabled.
@@ -58,6 +59,7 @@ class PeerSession {
   messages::VersionMessage remote_version_{};
   std::vector<std::uint8_t> peer_identity_public_key_;
   std::mutex send_mutex_;
+  std::uint64_t local_session_nonce_{0};
   std::chrono::steady_clock::time_point last_activity_{std::chrono::steady_clock::now()};
   std::string last_error_;
 };

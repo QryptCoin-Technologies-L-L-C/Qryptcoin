@@ -1,11 +1,12 @@
 ﻿#include "net/peer_manager.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <iostream>
 #include <sstream>
-#include <chrono>
 
 #include "net/messages.hpp"
+#include "util/csprng.hpp"
 
 namespace qryptcoin::net {
 
@@ -34,6 +35,13 @@ constexpr int kListenerBacklog = 128;
 constexpr int kBanThreshold = 100;
 constexpr std::chrono::minutes kBanDuration{60};
 
+std::string NormalizeHostLiteral(std::string host) {
+  if (host.size() >= 2 && host.front() == '[' && host.back() == ']') {
+    host = host.substr(1, host.size() - 2);
+  }
+  return host;
+}
+
 }  // namespace
 
 PeerManager::PeerManager(config::NetworkConfig config) : config_(std::move(config)) {
@@ -41,6 +49,14 @@ PeerManager::PeerManager(config::NetworkConfig config) : config_(std::move(confi
   max_inbound_peers_ = config_.max_inbound_peers > 0 ? config_.max_inbound_peers : kDefaultMaxInboundPeers;
   max_outbound_peers_ = config_.max_outbound_peers > 0 ? config_.max_outbound_peers : kDefaultMaxOutboundPeers;
   max_total_peers_ = config_.max_total_peers > 0 ? config_.max_total_peers : kDefaultMaxTotalPeers;
+  const auto nonce_bytes = util::SecureRandomBytes(sizeof(local_session_nonce_));
+  local_session_nonce_ = 0;
+  for (std::size_t i = 0; i < nonce_bytes.size(); ++i) {
+    local_session_nonce_ |= static_cast<std::uint64_t>(nonce_bytes[i]) << (8 * i);
+  }
+  if (local_session_nonce_ == 0) {
+    local_session_nonce_ = 1;
+  }
 
   inbound_handshake_ = [](PeerSession* session, const config::NetworkConfig& cfg) -> bool {
     return session != nullptr && session->PerformHandshake(cfg);
@@ -86,6 +102,20 @@ bool PeerManager::ConnectToPeer(const std::string& host, std::uint16_t port, std
     error->clear();
   }
 
+  // Refuse connections that would loop back to our own listener.
+  {
+    const std::string dial_host = NormalizeHostLiteral(ExtractHost(host));
+    const std::string listen_host = NormalizeHostLiteral(ExtractHost(config_.listen_address));
+    if (port == config_.listen_port &&
+        (dial_host == "0.0.0.0" || dial_host == "127.0.0.1" || dial_host == "::1" ||
+         dial_host == "::" || dial_host == listen_host)) {
+      if (error) {
+        *error = "refusing self-connection";
+      }
+      return false;
+    }
+  }
+
   auto dial_with = [&](const config::NetworkConfig& cfg,
                        std::uint32_t local_protocol,
                        std::shared_ptr<PeerSession>* out_peer,
@@ -116,6 +146,7 @@ bool PeerManager::ConnectToPeer(const std::string& host, std::uint16_t port, std
       }
     }
     session.SetEnforcePeerIdentityPinning(enforce_identity_pins);
+    session.SetLocalSessionNonce(local_session_nonce_);
     if (!session.PerformHandshake(cfg, local_protocol)) {
       if (out_error) {
         *out_error = !session.last_error().empty() ? session.last_error() : "handshake failed";
@@ -246,6 +277,7 @@ void PeerManager::ListenerThread() {
 
     auto session = std::make_shared<PeerSession>();
     session->Accept(std::move(inbound));
+    session->SetLocalSessionNonce(local_session_nonce_);
     if (!inbound_handshake_(session.get(), config_)) {
       const auto err = session->last_error();
       if (err == "peer identity key mismatch") {

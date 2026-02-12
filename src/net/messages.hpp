@@ -58,6 +58,7 @@ struct VersionMessage {
   bool requires_encryption{false};
   std::string network_id;
   primitives::Hash256 genesis_hash{};
+  std::uint64_t session_nonce{0};
 };
 
 struct VerAckMessage {};

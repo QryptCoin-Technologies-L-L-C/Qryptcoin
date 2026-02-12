@@ -51,6 +51,13 @@ class AddrManager {
   std::optional<Entry> Select(
       const std::unordered_set<std::string>& exclude_hosts = {}) const;
 
+  // Age-out failure counters so temporarily bad addresses can be retried.
+  void DecayFailureCounts(std::uint64_t max_age_seconds = 3600);
+  // Clear failure counters for every entry.
+  void ResetAllFailureCounts();
+  // Returns true when every known address has exceeded the consecutive-failure cap.
+  bool AllEntriesDemoted() const;
+
   // Persist the address table to disk in a simple JSON format.
   bool Save(const std::filesystem::path& path, std::string* error) const;
 

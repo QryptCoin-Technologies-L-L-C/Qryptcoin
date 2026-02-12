@@ -53,22 +53,30 @@ PeerSession::PeerSession(FrameChannel channel, bool initiator)
 
 PeerSession::PeerSession(PeerSession&& other) noexcept
     : initiator_(other.initiator_),
+      enforce_peer_identity_pinning_(other.enforce_peer_identity_pinning_),
       dial_target_(std::move(other.dial_target_)),
       channel_(std::move(other.channel_)),
       secure_channel_(std::move(other.secure_channel_)),
       negotiated_mode_(other.negotiated_mode_),
       remote_version_(other.remote_version_),
-      peer_identity_public_key_(std::move(other.peer_identity_public_key_)) {}
+      peer_identity_public_key_(std::move(other.peer_identity_public_key_)),
+      local_session_nonce_(other.local_session_nonce_),
+      last_activity_(other.last_activity_),
+      last_error_(std::move(other.last_error_)) {}
 
 PeerSession& PeerSession::operator=(PeerSession&& other) noexcept {
   if (this != &other) {
     initiator_ = other.initiator_;
+    enforce_peer_identity_pinning_ = other.enforce_peer_identity_pinning_;
     dial_target_ = std::move(other.dial_target_);
     channel_ = std::move(other.channel_);
     secure_channel_ = std::move(other.secure_channel_);
     negotiated_mode_ = other.negotiated_mode_;
     remote_version_ = other.remote_version_;
     peer_identity_public_key_ = std::move(other.peer_identity_public_key_);
+    local_session_nonce_ = other.local_session_nonce_;
+    last_activity_ = other.last_activity_;
+    last_error_ = std::move(other.last_error_);
   }
   return *this;
 }
@@ -129,6 +137,7 @@ bool PeerSession::PerformHandshake(const config::NetworkConfig& cfg,
   local_version.preferred_mode = cfg.encryption_mode;
   local_version.requires_encryption =
       cfg.encryption_required || cfg.authenticated_transport_required;
+  local_version.session_nonce = local_session_nonce_;
 
   const auto& expected_genesis = local_version.genesis_hash;
 
@@ -148,6 +157,15 @@ bool PeerSession::PerformHandshake(const config::NetworkConfig& cfg,
     return true;
   };
 
+  auto reject_self_connection = [&](const messages::VersionMessage& peer) -> bool {
+    if (local_session_nonce_ != 0 && peer.session_nonce != 0 &&
+        peer.session_nonce == local_session_nonce_) {
+      last_error_ = "self-connection detected";
+      return false;
+    }
+    return true;
+  };
+
   if (initiator_) {
     if (!channel_.Send(messages::EncodeVersion(local_version))) {
       last_error_ = "failed to send version";
@@ -163,6 +181,9 @@ bool PeerSession::PerformHandshake(const config::NetworkConfig& cfg,
       return false;
     }
     if (!validate_peer_protocol(remote_version_)) {
+      return false;
+    }
+    if (!reject_self_connection(remote_version_)) {
       return false;
     }
     if (!channel_.Send(messages::EncodeVerAck())) {
@@ -188,6 +209,9 @@ bool PeerSession::PerformHandshake(const config::NetworkConfig& cfg,
       return false;
     }
     if (!validate_peer_protocol(remote_version_)) {
+      return false;
+    }
+    if (!reject_self_connection(remote_version_)) {
       return false;
     }
     // Respond using a mutually supported protocol version so newer peers can

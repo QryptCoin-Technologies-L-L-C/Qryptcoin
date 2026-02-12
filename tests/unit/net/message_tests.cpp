@@ -30,6 +30,7 @@ int main() {
   version_msg.preferred_mode = qryptcoin::config::EncryptionMode::kEncrypted;
   version_msg.network_id = "katnet";
   version_msg.genesis_hash.fill(0x11);
+  version_msg.session_nonce = 0x1122334455667788ULL;
   auto version = EncodeVersion(version_msg);
   VersionMessage parsed;
   if (!DecodeVersion(version, &parsed)) {
@@ -43,6 +44,27 @@ int main() {
   }
   if (parsed.network_id != version_msg.network_id || parsed.genesis_hash != version_msg.genesis_hash) {
     std::cerr << "Version network binding mismatch\n";
+    return EXIT_FAILURE;
+  }
+  if (parsed.session_nonce != version_msg.session_nonce) {
+    std::cerr << "Version session nonce mismatch\n";
+    return EXIT_FAILURE;
+  }
+
+  // Backward compatibility: old version payloads omit session_nonce.
+  Message legacy_version = version;
+  if (legacy_version.payload.size() < sizeof(std::uint64_t)) {
+    std::cerr << "Version payload unexpectedly short\n";
+    return EXIT_FAILURE;
+  }
+  legacy_version.payload.resize(legacy_version.payload.size() - sizeof(std::uint64_t));
+  VersionMessage legacy_parsed;
+  if (!DecodeVersion(legacy_version, &legacy_parsed)) {
+    std::cerr << "DecodeVersion failed for legacy payload\n";
+    return EXIT_FAILURE;
+  }
+  if (legacy_parsed.session_nonce != 0) {
+    std::cerr << "Legacy version payload should decode session nonce as zero\n";
     return EXIT_FAILURE;
   }
   if (!qryptcoin::net::FrameChannel::ValidatePayloadLength(

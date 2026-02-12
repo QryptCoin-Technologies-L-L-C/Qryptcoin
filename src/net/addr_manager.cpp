@@ -16,7 +16,7 @@ constexpr std::size_t kMaxStoredAddresses = 2048;
 constexpr std::uint32_t kMaxConsecutiveFailures = 16;
 // Soft per-subnet cap to encourage diversity in the address table and
 // avoid a single /24 dominating outbound candidates.
-constexpr std::size_t kMaxAddressesPerGroup = 64;
+constexpr std::size_t kMaxAddressesPerGroup = 32;
 
 std::string SubnetKey(const std::string& host) {
   // Very simple IPv4 parsing: a.b.c.d -> a.b.c.0/24. Non-IPv4 hosts
@@ -168,6 +168,39 @@ std::optional<AddrManager::Entry> AddrManager::Select(
     return entry;
   }
   return std::nullopt;
+}
+
+void AddrManager::DecayFailureCounts(std::uint64_t max_age_seconds) {
+  const auto now = NowSeconds();
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (auto& entry : entries_) {
+    if (entry.attempts == 0 || entry.last_attempt == 0 || now <= entry.last_attempt) {
+      continue;
+    }
+    if (now - entry.last_attempt > max_age_seconds) {
+      entry.attempts /= 2;
+    }
+  }
+}
+
+void AddrManager::ResetAllFailureCounts() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (auto& entry : entries_) {
+    entry.attempts = 0;
+  }
+}
+
+bool AddrManager::AllEntriesDemoted() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (entries_.empty()) {
+    return false;
+  }
+  for (const auto& entry : entries_) {
+    if (entry.attempts <= kMaxConsecutiveFailures) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool AddrManager::Save(const std::filesystem::path& path, std::string* error) const {

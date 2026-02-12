@@ -1,3 +1,4 @@
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -5,6 +6,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_set>
 
 #include "net/addr_manager.hpp"
@@ -129,6 +131,54 @@ int main() {
       // Empty exclude set should work normally.
       if (!excl_mgr.Select().has_value()) {
         std::cerr << "expected a candidate with empty exclusion set\n";
+        return 1;
+      }
+    }
+
+    // Test: decay failure counters for stale entries.
+    {
+      AddrManager decay_mgr;
+      decay_mgr.Add("198.51.100.9", 9375, false);
+      for (int i = 0; i < 8; ++i) {
+        decay_mgr.MarkResult("198.51.100.9", 9375, false);
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+      decay_mgr.DecayFailureCounts(0);
+      if (!decay_mgr.Save(peers_path, &error)) {
+        std::cerr << "save failed: " << error << "\n";
+        return 1;
+      }
+      const auto decay_json = ReadJsonFile(peers_path);
+      const auto attempts_after_decay =
+          decay_json.at(0).value("attempts", 0U);
+      if (attempts_after_decay != 4U) {
+        std::cerr << "expected decay to halve attempts (8 -> 4)\n";
+        return 1;
+      }
+    }
+
+    // Test: demotion detection and emergency reset.
+    {
+      AddrManager demoted_mgr;
+      demoted_mgr.Add("198.51.100.10", 9375, false);
+      for (int i = 0; i < 17; ++i) {
+        demoted_mgr.MarkResult("198.51.100.10", 9375, false);
+      }
+      if (!demoted_mgr.AllEntriesDemoted()) {
+        std::cerr << "expected all entries to be demoted after repeated failures\n";
+        return 1;
+      }
+      if (demoted_mgr.Select().has_value()) {
+        std::cerr << "expected no selection while all entries are demoted\n";
+        return 1;
+      }
+      demoted_mgr.ResetAllFailureCounts();
+      if (demoted_mgr.AllEntriesDemoted()) {
+        std::cerr << "expected reset to clear demotion state\n";
+        return 1;
+      }
+      if (!demoted_mgr.Select().has_value()) {
+        std::cerr << "expected selection to recover after reset\n";
         return 1;
       }
     }

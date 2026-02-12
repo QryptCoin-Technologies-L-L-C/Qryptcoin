@@ -1557,7 +1557,9 @@ void WaitForShutdown(NodeContext& node, qryptcoin::net::AddrManager* addrman,
   SeedLoopState seed_state;
   using clock = std::chrono::steady_clock;
   constexpr auto kPeersSaveInterval = std::chrono::seconds(60);
+  constexpr auto kAddrDecayInterval = std::chrono::minutes(60);
   auto next_peers_save = clock::now() + kPeersSaveInterval;
+  auto next_addr_decay = clock::now() + kAddrDecayInterval;
 
   // Stale-tip detection: if the chain tip hasn't advanced in this long,
   // evict the most-idle outbound peer and let MaintainOutboundPeers
@@ -1576,6 +1578,21 @@ void WaitForShutdown(NodeContext& node, qryptcoin::net::AddrManager* addrman,
                           qryptcoin::config::GetNetworkConfig().listen_port,
                           opts.target_outbound_peers);
     MaybeRunSeedLoop(node, addrman, dns_seeds, opts, &seed_state, opts.target_outbound_peers);
+    if (addrman) {
+      const auto now = clock::now();
+      if (now >= next_addr_decay) {
+        addrman->DecayFailureCounts(3600);
+        next_addr_decay = now + kAddrDecayInterval;
+      }
+      if (node.peer_manager) {
+        const auto stats = node.peer_manager->GetStats();
+        if (stats.outbound == 0 && addrman->AllEntriesDemoted()) {
+          addrman->ResetAllFailureCounts();
+          std::cerr << "[qryptd] warn: addrman exhausted while outbound peers are zero; "
+                       "resetting failure counters\n";
+        }
+      }
+    }
 
     // Stale-tip peer rotation.
     {

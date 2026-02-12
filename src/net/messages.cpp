@@ -61,6 +61,7 @@ Message EncodeVersion(const VersionMessage& msg) {
   WriteVarInt(&message.payload, msg.network_id.size());
   message.payload.insert(message.payload.end(), msg.network_id.begin(), msg.network_id.end());
   message.payload.insert(message.payload.end(), msg.genesis_hash.begin(), msg.genesis_hash.end());
+  WriteUint64(&message.payload, msg.session_nonce);
   return message;
 }
 
@@ -87,6 +88,7 @@ bool DecodeVersion(const Message& msg, VersionMessage* out) {
   out->requires_encryption = requires_flag != 0;
   out->network_id.clear();
   out->genesis_hash.fill(0);
+  out->session_nonce = 0;
   if (out->protocol_version < kMinProtocolVersion) {
     return false;
   }
@@ -106,6 +108,14 @@ bool DecodeVersion(const Message& msg, VersionMessage* out) {
   offset += static_cast<std::size_t>(network_len);
   std::copy_n(msg.payload.begin() + offset, out->genesis_hash.size(), out->genesis_hash.begin());
   offset += out->genesis_hash.size();
+  if (offset == msg.payload.size()) {
+    return true;
+  }
+  if (!EnsureAvailable(msg.payload, offset, sizeof(std::uint64_t))) {
+    return false;
+  }
+  out->session_nonce = ReadUint64(msg.payload.data() + offset);
+  offset += sizeof(std::uint64_t);
   return offset == msg.payload.size();
 }
 
