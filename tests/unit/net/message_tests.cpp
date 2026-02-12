@@ -67,6 +67,17 @@ int main() {
     std::cerr << "Legacy version payload should decode session nonce as zero\n";
     return EXIT_FAILURE;
   }
+
+  // Encoding with nonce=0 must produce the same payload as the legacy
+  // format (no trailing bytes) so older nodes with a strict offset==size
+  // check in DecodeVersion can still parse the message.
+  VersionMessage zero_nonce_msg = version_msg;
+  zero_nonce_msg.session_nonce = 0;
+  auto zero_nonce_encoded = EncodeVersion(zero_nonce_msg);
+  if (zero_nonce_encoded.payload.size() != legacy_version.payload.size()) {
+    std::cerr << "Encoding with nonce=0 should omit trailing nonce bytes\n";
+    return EXIT_FAILURE;
+  }
   if (!qryptcoin::net::FrameChannel::ValidatePayloadLength(
           qryptcoin::net::FrameChannel::kMaxFramePayload)) {
     std::cerr << "Max payload rejected unexpectedly\n";

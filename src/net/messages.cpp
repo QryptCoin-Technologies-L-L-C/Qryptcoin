@@ -61,7 +61,16 @@ Message EncodeVersion(const VersionMessage& msg) {
   WriteVarInt(&message.payload, msg.network_id.size());
   message.payload.insert(message.payload.end(), msg.network_id.begin(), msg.network_id.end());
   message.payload.insert(message.payload.end(), msg.genesis_hash.begin(), msg.genesis_hash.end());
-  WriteUint64(&message.payload, msg.session_nonce);
+  // Only append session_nonce when non-zero. Older nodes have a strict
+  // offset==size check at the end of DecodeVersion and will reject any
+  // message with unexpected trailing bytes. Omitting the nonce when it
+  // is zero keeps the payload identical to the pre-nonce format so
+  // existing deployments continue to interoperate. Once the entire
+  // network is running code that tolerates the trailing field, the
+  // nonce can be sent unconditionally.
+  if (msg.session_nonce != 0) {
+    WriteUint64(&message.payload, msg.session_nonce);
+  }
   return message;
 }
 

@@ -139,7 +139,10 @@ bool PeerSession::PerformHandshake(const config::NetworkConfig& cfg,
   local_version.preferred_mode = cfg.encryption_mode;
   local_version.requires_encryption =
       cfg.encryption_required || cfg.authenticated_transport_required;
-  local_version.session_nonce = local_session_nonce_;
+  // Nonce-based self-connection detection is deferred until the network
+  // has fully rolled over to code that tolerates the trailing nonce
+  // field in the version payload.  Older nodes reject the extra bytes.
+  // local_version.session_nonce = local_session_nonce_;
 
   const auto& expected_genesis = local_version.genesis_hash;
 
