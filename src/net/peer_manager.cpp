@@ -98,7 +98,8 @@ void PeerManager::Stop() {
 }
 
 bool PeerManager::ConnectToPeer(const std::string& host, std::uint16_t port, std::string* error,
-                                bool enforce_identity_pins) {
+                                bool enforce_identity_pins,
+                                bool allow_duplicate_outbound_host) {
   if (error) {
     error->clear();
   }
@@ -177,7 +178,7 @@ bool PeerManager::ConnectToPeer(const std::string& host, std::uint16_t port, std
   {
     std::lock_guard<std::mutex> lock(peers_mutex_);
     const std::string address = peer->PeerAddress();
-    if (!HasCapacityForAddressLocked(false, address)) {
+    if (!HasCapacityForAddressLocked(false, address, allow_duplicate_outbound_host)) {
       std::cerr << "Outbound peer limit or ban reached, refusing new connection\n";
       return false;
     }
@@ -495,7 +496,8 @@ std::size_t PeerManager::CountOutboundPeersLocked() const {
   return count;
 }
 
-bool PeerManager::HasCapacityForAddressLocked(bool inbound, const std::string& address) const {
+bool PeerManager::HasCapacityForAddressLocked(bool inbound, const std::string& address,
+                                              bool allow_duplicate_outbound_host) const {
   // Enforce global inbound/outbound/total limits first.
   if (!HasCapacityLocked(inbound)) {
     return false;
@@ -507,7 +509,8 @@ bool PeerManager::HasCapacityForAddressLocked(bool inbound, const std::string& a
   // Without this guard a single seed returning the same IP fills every
   // outbound slot with duplicate connections, leaving the node unable
   // to learn about the rest of the network.
-  if (!inbound && IsAlreadyConnectedOutboundLocked(address)) {
+  if (!inbound && !allow_duplicate_outbound_host &&
+      IsAlreadyConnectedOutboundLocked(address)) {
     return false;
   }
   const std::string host = ExtractHost(address);

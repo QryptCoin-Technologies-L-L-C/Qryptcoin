@@ -35,6 +35,10 @@ dist/
 rpc.cookie
 tmp_rpc.json
 
+# Explorer deployment (secrets live in env files; keep compose private)
+explorer/docker-compose.yml
+explorer/*.env
+
 # OS
 .DS_Store
 Thumbs.db

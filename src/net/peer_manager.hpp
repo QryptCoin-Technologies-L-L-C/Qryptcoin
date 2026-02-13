@@ -49,7 +49,8 @@ class PeerManager {
   bool StartListener();
   void Stop();
   bool ConnectToPeer(const std::string& host, std::uint16_t port, std::string* error = nullptr,
-                     bool enforce_identity_pins = true);
+                     bool enforce_identity_pins = true,
+                     bool allow_duplicate_outbound_host = false);
   void BroadcastInventory(const messages::InventoryMessage& inv);
   void BroadcastMessage(const messages::Message& message);
   void BroadcastPing(std::uint64_t nonce);
@@ -93,7 +94,8 @@ class PeerManager {
   std::vector<PeerInfo> SnapshotPeerInfos() const;
   std::vector<PeerEntry>::iterator FindPeerLocked(std::uint64_t peer_id);
   bool HasCapacityLocked(bool inbound) const;
-  bool HasCapacityForAddressLocked(bool inbound, const std::string& address) const;
+  bool HasCapacityForAddressLocked(bool inbound, const std::string& address,
+                                   bool allow_duplicate_outbound_host = false) const;
   std::size_t CountInboundPeersLocked() const;
   std::size_t CountOutboundPeersLocked() const;
   bool IsAddressBannedLocked(const std::string& address) const;

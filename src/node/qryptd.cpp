@@ -332,6 +332,14 @@ struct Options {
   std::size_t target_outbound_peers{10};
 };
 
+bool FileExistsNoThrow(const std::filesystem::path& path) {
+  if (path.empty()) {
+    return false;
+  }
+  std::error_code ec;
+  return std::filesystem::exists(path, ec) && !ec;
+}
+
 void PrintUsage() {
   std::cout << "qryptd options:\n"
              << "  --network <net>            mainnet, testnet, regtest, signet (default: mainnet)\n"
@@ -356,10 +364,12 @@ void PrintUsage() {
              << "  --nolisten                 Disable inbound P2P connections (outbound-only)\n"
              << "  --listen <0|1>             Enable/disable inbound P2P (default: 1)\n"
              << "  --mining-address <qry1...> Default reward address for getblocktemplate\n"
-             << "  --connect-peer <host:port> Manually connect to a specific peer (repeatable)\n"
+             << "  --connect-peer <host[:port]> Manually connect to a specific peer (repeatable)\n"
+             << "  --addnode <host[:port]>    Alias for --connect-peer (repeatable)\n"
              << "  --max-inbound-peers <n>    Override inbound peer limit (0=default)\n"
              << "  --max-outbound-peers <n>   Override outbound peer limit (0=default)\n"
              << "  --max-total-peers <n>      Override total peer limit (0=default)\n"
+             << "  --target-outbound-peers <n> Maintain up to n outbound peers (default: 10)\n"
              << "  --mempool-limit-mb <mb>    Target mempool size limit in MB (default: 300)\n"
              << "  --mempool-expiry-seconds <sec> Evict mempool txs older than <sec> (0=disable, default: 1209600)\n"
              << "  --mempool-rebroadcast-seconds <sec> Re-announce mempool txids every <sec> (0=disable, default: 1800)\n"
@@ -380,7 +390,7 @@ void PrintUsage() {
             << "  --log-level <lvl>          Log level: debug, info, warn, error (default: debug)\n"
             << "  --log-max-size-mb <mb>     Rotate debug log after approximately <mb> megabytes (0=disable)\n"
             << "  --log-max-files <n>        Number of rotated debug log files to keep (default: 0)\n"
-            << "  --conf <path>              Load options from qryptcoin.conf (default: ./qryptcoin.conf)\n"
+            << "  --conf <path>              Load options from qryptcoin.conf (default: ./qryptcoin.conf, fallback to user config dir)\n"
             << "  --no-conf                  Disable config file loading\n";
 }
 
@@ -419,6 +429,37 @@ std::optional<std::string> GetEnvValue(std::string_view name) {
     return std::nullopt;
   }
   return std::string(value);
+}
+
+std::filesystem::path DefaultUserConfigPath() {
+#ifdef _WIN32
+  if (auto appdata = GetEnvValue("APPDATA")) {
+    return std::filesystem::path(*appdata) / "QryptCoin" / "qryptcoin.conf";
+  }
+#else
+  if (auto xdg = GetEnvValue("XDG_CONFIG_HOME")) {
+    return std::filesystem::path(*xdg) / "qryptcoin" / "qryptcoin.conf";
+  }
+  if (auto home = GetEnvValue("HOME")) {
+    return std::filesystem::path(*home) / ".qryptcoin" / "qryptcoin.conf";
+  }
+#endif
+  return {};
+}
+
+std::filesystem::path ResolveConfigPath(const Options& opts) {
+  if (!opts.config_path.empty()) {
+    return std::filesystem::path(opts.config_path);
+  }
+  const std::filesystem::path local_config = "qryptcoin.conf";
+  if (FileExistsNoThrow(local_config)) {
+    return local_config;
+  }
+  const auto user_config = DefaultUserConfigPath();
+  if (FileExistsNoThrow(user_config)) {
+    return user_config;
+  }
+  return local_config;
 }
 
 void ApplyEnvironmentOverrides(Options* opts) {
@@ -529,7 +570,28 @@ void ApplyEnvironmentOverrides(Options* opts) {
       opts->connect_peers.push_back(std::string(v));
     }
   }
+  if (auto value = GetEnvValue("QRY_ADDNODE")) {
+    auto v = trim(*value);
+    if (!v.empty()) {
+      opts->connect_peers.push_back(std::string(v));
+    }
+  }
   if (auto value = GetEnvValue("QRY_CONNECT_PEERS")) {
+    std::string_view list = *value;
+    while (!list.empty()) {
+      auto sep = list.find(',');
+      auto token = (sep == std::string_view::npos) ? list : list.substr(0, sep);
+      token = trim(token);
+      if (!token.empty()) {
+        opts->connect_peers.push_back(std::string(token));
+      }
+      if (sep == std::string_view::npos) {
+        break;
+      }
+      list.remove_prefix(sep + 1);
+    }
+  }
+  if (auto value = GetEnvValue("QRY_ADDNODES")) {
     std::string_view list = *value;
     while (!list.empty()) {
       auto sep = list.find(',');
@@ -563,6 +625,9 @@ void ApplyEnvironmentOverrides(Options* opts) {
   }
   if (auto value = GetEnvValue("QRY_MAX_TOTAL_PEERS")) {
     opts->max_total_peers = static_cast<std::size_t>(std::stoul(*value));
+  }
+  if (auto value = GetEnvValue("QRY_TARGET_OUTBOUND_PEERS")) {
+    opts->target_outbound_peers = static_cast<std::size_t>(std::stoul(*value));
   }
 }
 
@@ -629,9 +694,11 @@ void ApplyConfigOption(const std::string& raw_key, const std::string& value, Opt
     opts->max_outbound_peers = static_cast<std::size_t>(std::stoul(value));
   } else if (key == "maxtotalpeers") {
     opts->max_total_peers = static_cast<std::size_t>(std::stoul(value));
+  } else if (key == "targetoutboundpeers") {
+    opts->target_outbound_peers = static_cast<std::size_t>(std::stoul(value));
   } else if (key == "miningaddress") {
     opts->mining_address = value;
-  } else if (key == "connect" || key == "connectpeer") {
+  } else if (key == "connect" || key == "connectpeer" || key == "addnode") {
     opts->connect_peers.push_back(value);
   } else if (key == "mempoollimitmb") {
     opts->mempool_limit_mb = static_cast<std::size_t>(std::stoul(value));
@@ -759,9 +826,7 @@ Options ParseOptions(int argc, char** argv) {
   }
 
   if (!opts.disable_config_file) {
-    std::filesystem::path config_path =
-        opts.config_path.empty() ? std::filesystem::path("qryptcoin.conf")
-                                 : std::filesystem::path(opts.config_path);
+    std::filesystem::path config_path = ResolveConfigPath(opts);
     LoadConfigFile(config_path, &opts);
   }
 
@@ -834,7 +899,7 @@ Options ParseOptions(int argc, char** argv) {
       opts.require_authenticated_transport_explicit = true;
     } else if (arg == "--allow-private-peers") {
       opts.allow_private_peers = true;
-    } else if (arg == "--connect-peer") {
+    } else if (arg == "--connect-peer" || arg == "--addnode") {
       opts.connect_peers.push_back(ensure_value(i));
     } else if (arg == "--max-inbound-peers") {
       opts.max_inbound_peers = static_cast<std::size_t>(std::stoul(ensure_value(i)));
@@ -842,6 +907,8 @@ Options ParseOptions(int argc, char** argv) {
       opts.max_outbound_peers = static_cast<std::size_t>(std::stoul(ensure_value(i)));
     } else if (arg == "--max-total-peers") {
       opts.max_total_peers = static_cast<std::size_t>(std::stoul(ensure_value(i)));
+    } else if (arg == "--target-outbound-peers") {
+      opts.target_outbound_peers = static_cast<std::size_t>(std::stoul(ensure_value(i)));
     } else if (arg == "--fee-estimator-decay") {
       opts.fee_estimator_decay = std::stod(ensure_value(i));
     } else if (arg == "--fee-estimator-samples") {
@@ -1037,7 +1104,120 @@ bool IsLoopbackAddress(std::string host) {
   return false;
 }
 
-  bool AttemptSeedConnections(qryptcoin::net::PeerManager& manager,
+struct ParsedPeerTarget {
+  std::string host;
+  std::uint16_t port{0};
+};
+
+bool ParsePeerTarget(std::string_view raw_target, std::uint16_t default_port,
+                     ParsedPeerTarget* out, std::string* error) {
+  if (error) {
+    error->clear();
+  }
+  if (!out) {
+    if (error) {
+      *error = "internal target parse error";
+    }
+    return false;
+  }
+  const std::string target = Trim(std::string(raw_target));
+  if (target.empty()) {
+    if (error) {
+      *error = "empty target";
+    }
+    return false;
+  }
+
+  auto parse_port = [&](std::string_view text, std::uint16_t* parsed_port) -> bool {
+    if (text.empty()) {
+      if (error) {
+        *error = "missing port";
+      }
+      return false;
+    }
+    const std::string port_text = Trim(std::string(text));
+    if (port_text.empty()) {
+      if (error) {
+        *error = "missing port";
+      }
+      return false;
+    }
+    unsigned long port_value = 0;
+    try {
+      port_value = std::stoul(port_text);
+    } catch (const std::exception&) {
+      if (error) {
+        *error = "invalid port";
+      }
+      return false;
+    }
+    if (port_value == 0 || port_value > 65535) {
+      if (error) {
+        *error = "port out of range";
+      }
+      return false;
+    }
+    *parsed_port = static_cast<std::uint16_t>(port_value);
+    return true;
+  };
+
+  std::string host;
+  std::uint16_t port = default_port;
+  if (!target.empty() && target.front() == '[') {
+    const auto close = target.find(']');
+    if (close == std::string::npos || close <= 1) {
+      if (error) {
+        *error = "invalid bracketed IPv6 target";
+      }
+      return false;
+    }
+    host = target.substr(1, close - 1);
+    if (close + 1 < target.size()) {
+      if (target[close + 1] != ':') {
+        if (error) {
+          *error = "invalid bracketed IPv6 target";
+        }
+        return false;
+      }
+      if (!parse_port(std::string_view(target).substr(close + 2), &port)) {
+        return false;
+      }
+    }
+  } else {
+    const auto first_colon = target.find(':');
+    const auto last_colon = target.rfind(':');
+    if (first_colon == std::string::npos) {
+      host = target;
+    } else if (first_colon == last_colon) {
+      host = target.substr(0, first_colon);
+      if (!parse_port(std::string_view(target).substr(first_colon + 1), &port)) {
+        return false;
+      }
+    } else {
+      // Unbracketed IPv6 literal without explicit port.
+      host = target;
+    }
+  }
+
+  host = Trim(host);
+  if (host.empty()) {
+    if (error) {
+      *error = "missing host";
+    }
+    return false;
+  }
+  if (port == 0) {
+    if (error) {
+      *error = "missing default port";
+    }
+    return false;
+  }
+  out->host = std::move(host);
+  out->port = port;
+  return true;
+}
+
+bool AttemptSeedConnections(qryptcoin::net::PeerManager& manager,
                               qryptcoin::net::AddrManager* addrman,
                               const std::vector<std::string>& seeds, std::uint16_t port,
                               bool resolve_dns, std::size_t max_attempts, bool permanent) {
@@ -1378,19 +1558,26 @@ bool AppInitMain(Options opts, NodeContext* node, qryptcoin::net::AddrManager* a
                                       /*max_attempts=*/16,
                                       /*permanent=*/false);
   for (const auto& target : opts.connect_peers) {
-    auto sep = target.rfind(':');
-    if (sep == std::string::npos) {
-      std::cout << "[qryptd] invalid connect-peer target: " << target << "\n";
+    ParsedPeerTarget parsed{};
+    std::string parse_error;
+    if (!ParsePeerTarget(target, default_seed_port, &parsed, &parse_error)) {
+      std::cout << "[qryptd] invalid connect-peer target: " << target;
+      if (!parse_error.empty()) {
+        std::cout << " (" << parse_error << ")";
+      }
+      std::cout << "\n";
       continue;
     }
-    auto host = target.substr(0, sep);
-    auto port = static_cast<std::uint16_t>(std::stoi(target.substr(sep + 1)));
-    LogDebug("Attempting manual peer connection to " + host + ":" + std::to_string(port));
-    if (node->peer_manager->ConnectToPeer(host, port)) {
-      LogDebug("Manual peer connection to " + host + " succeeded");
+    if (addrman) {
+      addrman->Add(parsed.host, parsed.port, /*permanent=*/false);
+    }
+    LogDebug("Attempting manual peer connection to " + parsed.host + ":" +
+             std::to_string(parsed.port));
+    if (node->peer_manager->ConnectToPeer(parsed.host, parsed.port)) {
+      LogDebug("Manual peer connection to " + parsed.host + " succeeded");
       connected = true;
     } else {
-      LogDebug("Manual peer connection to " + host + " failed");
+      LogDebug("Manual peer connection to " + parsed.host + " failed");
       std::cout << "[qryptd] warn: connect-peer " << target << " failed\n";
     }
   }
@@ -1399,7 +1586,7 @@ bool AppInitMain(Options opts, NodeContext* node, qryptcoin::net::AddrManager* a
       std::cout << "[qryptd] warn: no seed connections succeeded; waiting for inbound peers\n";
     } else {
       std::cout << "[qryptd] warn: no seed connections succeeded and inbound P2P is disabled; "
-                   "configure connect= targets\n";
+                   "configure connect=/addnode targets\n";
     }
   }
   return true;
@@ -1461,13 +1648,24 @@ void MaintainOutboundPeers(qryptcoin::net::PeerManager* peers,
       return;
     }
     auto candidate = addrman->Select(connected_hosts);
+    bool allow_duplicate_outbound_host = false;
+    if (!candidate && !connected_hosts.empty()) {
+      // Fallback for sparse networks: when there are no unique candidates left,
+      // allow additional outbound links to already-connected hosts so the node
+      // can continue filling its outbound target.
+      candidate = addrman->Select();
+      if (candidate && connected_hosts.count(candidate->host) > 0) {
+        allow_duplicate_outbound_host = true;
+      }
+    }
     if (!candidate) {
       break;
     }
     const std::string host = candidate->host;
     const std::uint16_t port = candidate->port != 0 ? candidate->port : default_port;
     const bool enforce_identity_pins = candidate->permanent;
-    if (peers->ConnectToPeer(host, port, /*error=*/nullptr, enforce_identity_pins)) {
+    if (peers->ConnectToPeer(host, port, /*error=*/nullptr, enforce_identity_pins,
+                             allow_duplicate_outbound_host)) {
       addrman->MarkResult(host, port, true);
     } else {
       addrman->MarkResult(host, port, false);
@@ -1762,6 +1960,14 @@ int main(int argc, char** argv) {
     }
     for (const auto& host : opts.extra_static_seeds) {
       addrman.Add(host, net_cfg.listen_port, true);
+    }
+    for (const auto& target : opts.connect_peers) {
+      ParsedPeerTarget parsed{};
+      std::string parse_error;
+      if (!ParsePeerTarget(target, net_cfg.listen_port, &parsed, &parse_error)) {
+        continue;
+      }
+      addrman.Add(parsed.host, parsed.port, false);
     }
 
     WaitForShutdown(node, &addrman, opts, &dns_seeds, peers_path);
