@@ -27,6 +27,7 @@ jobs:
         uses: github/codeql-action/init@ab28d5ce09b08e4700b2296d39d684a7ac71d1e7 # v4
         with:
           languages: cpp
+          queries: security-extended
           config-file: .github/codeql/codeql-config.yml
 
       - name: Configure

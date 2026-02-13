@@ -1,0 +1,43 @@
+name: Semgrep SAST
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  schedule:
+    - cron: "0 4 * * 1" # Weekly on Monday at 4:00 UTC
+
+permissions: read-all
+
+jobs:
+  semgrep:
+    name: Semgrep Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    container:
+      image: semgrep/semgrep
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+
+      - name: Run Semgrep
+        run: semgrep scan --config auto --sarif --output semgrep-results.sarif
+        env:
+          SEMGREP_RULES: >-
+            p/default
+            p/security-audit
+            p/owasp-top-ten
+            p/command-injection
+            p/insecure-transport
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@60d8f0d1f1f8c8d07ef53bd027032705d414ec28 # v3
+        with:
+          sarif_file: semgrep-results.sarif
+          category: semgrep
