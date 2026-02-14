@@ -41,6 +41,10 @@ struct WalletUTXO {
   // can monitor but cannot spend from because it does not possess
   // the corresponding private keys.
   bool watch_only{false};
+  // Set when the wallet discovers that this UTXO no longer exists in the
+  // confirmed chain UTXO set or mempool. Orphaned UTXOs are excluded from
+  // coin selection and balance calculations.
+  bool orphaned{false};
 };
 
 struct CreatedTransaction {
@@ -160,6 +164,9 @@ class HDWallet {
   // Mark a UTXO as spent given its outpoint. Used during rescan to process
   // transaction inputs. Returns true if the UTXO was found and marked spent.
   bool MarkUtxoSpent(const primitives::COutPoint& outpoint);
+  // Mark a UTXO as orphaned (no longer exists in the chain UTXO set or
+  // mempool). Orphaned UTXOs are skipped during coin selection.
+  bool MarkUtxoOrphaned(const primitives::COutPoint& outpoint);
   std::optional<CreatedTransaction> CreateTransaction(
       const std::vector<std::pair<std::string, primitives::Amount>>& outputs,
       primitives::Amount fee_rate, std::string* error);

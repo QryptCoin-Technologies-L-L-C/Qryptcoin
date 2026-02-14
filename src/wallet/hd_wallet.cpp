@@ -989,7 +989,7 @@ primitives::Amount HDWallet::GetBalance() const {
   std::unordered_map<std::array<std::uint8_t, 32>, BestCandidate, SeedHasher> best_by_stealth;
   best_by_stealth.reserve(utxos_.size());
   for (const auto& utxo : utxos_) {
-    if (utxo.spent || utxo.watch_only) {
+    if (utxo.spent || utxo.orphaned || utxo.watch_only) {
       continue;
     }
     if (utxo.txout.value == 0) {
@@ -1226,6 +1226,19 @@ bool HDWallet::MarkUtxoSpent(const primitives::COutPoint& outpoint) {
   return false;  // Not found
 }
 
+bool HDWallet::MarkUtxoOrphaned(const primitives::COutPoint& outpoint) {
+  for (auto& utxo : utxos_) {
+    if (utxo.outpoint.txid == outpoint.txid && utxo.outpoint.index == outpoint.index) {
+      if (!utxo.orphaned) {
+        utxo.orphaned = true;
+        return true;
+      }
+      return false;  // Already orphaned
+    }
+  }
+  return false;  // Not found
+}
+
 HDWallet::KeyMaterial HDWallet::DeriveKeyMaterial(std::uint32_t index,
                                                   crypto::SignatureAlgorithm /*algorithm*/) const {
   KeyMaterial material;
@@ -1433,7 +1446,7 @@ std::optional<CreatedTransaction> HDWallet::CreateTransactionInternal(
   best_by_stealth.reserve(utxos_.size());
   for (std::size_t i = 0; i < utxos_.size(); ++i) {
     const auto& utxo = utxos_[i];
-    if (utxo.spent || utxo.watch_only || utxo.txout.value == 0) {
+    if (utxo.spent || utxo.orphaned || utxo.watch_only || utxo.txout.value == 0) {
       continue;
     }
     Candidate candidate{i, utxo.txout.value, utxo.is_change, utxo.coinbase};
@@ -1917,6 +1930,7 @@ std::vector<std::uint8_t> HDWallet::SerializeState() const {
     std::uint8_t utxo_flags = 0;
     if (utxo.coinbase) utxo_flags |= 0x01;
     if (utxo.is_change) utxo_flags |= 0x02;
+    if (utxo.orphaned) utxo_flags |= 0x04;
     buffer.push_back(utxo_flags);
   }
   if (!burned_key_indices_.empty()) {
@@ -2155,6 +2169,7 @@ bool HDWallet::DeserializeState(const std::vector<std::uint8_t>& payload, std::u
       if (utxo.outpoint.txid == outpoint.txid && utxo.outpoint.index == outpoint.index) {
         utxo.coinbase = (flags & 0x01) != 0;
         utxo.is_change = (flags & 0x02) != 0;
+        utxo.orphaned = (flags & 0x04) != 0;
         break;
       }
     }

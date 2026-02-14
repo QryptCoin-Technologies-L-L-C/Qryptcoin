@@ -1569,6 +1569,24 @@ nlohmann::json RpcServer::HandleListUtxos() const {
     // Rough witness-size estimate based on PQ algorithm.
     entry["witness_est_bytes"] = EstimateWitnessBytes(utxo.algorithm);
 
+    // Computed UTXO state: available, pending, spent, or orphaned.
+    std::string state;
+    if (utxo.orphaned) {
+      state = "orphaned";
+    } else if (utxo.spent) {
+      state = "spent";
+    } else {
+      std::lock_guard<std::mutex> lock(mempool_mutex_);
+      auto it = mempool_spends_.find(utxo.outpoint);
+      if (it != mempool_spends_.end()) {
+        state = "pending";
+        entry["pending_txid"] = HashToHex(it->second);
+      } else {
+        state = "available";
+      }
+    }
+    entry["state"] = state;
+
     result.push_back(entry);
   }
 
@@ -1767,6 +1785,31 @@ nlohmann::json RpcServer::HandleSendToAddress(const nlohmann::json& params) {
     }
     fee_rate = converted;
   }
+  // Prune wallet UTXOs that no longer exist in the chain or mempool.
+  {
+    std::vector<primitives::COutPoint> to_orphan;
+    for (const auto& utxo : wallet.TrackedUtxos()) {
+      if (utxo.spent || utxo.orphaned || utxo.watch_only) continue;
+      consensus::Coin coin;
+      if (!chain_.GetCoin(utxo.outpoint, &coin)) {
+        bool in_mempool = false;
+        {
+          std::lock_guard<std::mutex> lock(mempool_mutex_);
+          in_mempool = mempool_by_txid_.count(utxo.outpoint.txid) > 0;
+        }
+        if (!in_mempool) {
+          to_orphan.push_back(utxo.outpoint);
+        }
+      }
+    }
+    for (const auto& outpoint : to_orphan) {
+      wallet.MarkUtxoOrphaned(outpoint);
+    }
+    if (!to_orphan.empty()) {
+      wallet.Save();
+    }
+  }
+
   std::vector<std::pair<std::string, primitives::Amount>> outputs = {{address, *amount}};
   std::string error;
   auto created = wallet.CreateTransaction(outputs, fee_rate, &error);
