@@ -1,2 +1,4 @@
 # Requirements for coverage workflow - pinned versions for reproducibility
-gcovr==8.6
+gcovr==8.6 \
+    --hash=sha256:dbf9d87c38042752ad6f530aa8210427e22b526611bb7b7bfed0e81977d1f1ef \
+    --hash=sha256:b2e7042abca9321cadbab8a06eb34d19f801b831557b28cdc30a029313de8b9e

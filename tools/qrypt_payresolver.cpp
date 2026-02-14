@@ -117,7 +117,8 @@ std::optional<std::string> ResolveBasicAuth(const Options& opts) {
   if (opts.data_dir.empty()) {
     return std::nullopt;
   }
-  const auto cookie_path = std::filesystem::path(opts.data_dir) / "rpc.cookie";
+  const auto cookie_path =
+      std::filesystem::weakly_canonical(std::filesystem::path(opts.data_dir) / "rpc.cookie");
   std::error_code ec;
   const bool cookie_exists = std::filesystem::exists(cookie_path, ec);
   std::ifstream in(cookie_path);
@@ -603,6 +604,10 @@ Options ParseOptions(int argc, char** argv) {
     } else {
       throw std::runtime_error("unknown option: " + arg);
     }
+  }
+  if (!opts.data_dir.empty()) {
+    opts.data_dir = std::filesystem::weakly_canonical(
+        std::filesystem::path(opts.data_dir)).string();
   }
   return opts;
 }

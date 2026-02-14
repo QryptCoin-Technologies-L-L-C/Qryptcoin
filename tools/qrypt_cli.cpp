@@ -371,6 +371,10 @@ CliOptions ParseOptions(int argc, char** argv) {
       opts.args.emplace_back(arg);
     }
   }
+  if (!opts.data_dir.empty()) {
+    opts.data_dir = std::filesystem::weakly_canonical(
+        std::filesystem::path(opts.data_dir)).string();
+  }
   return opts;
 }
 
@@ -464,7 +468,8 @@ std::optional<std::string> ResolveBasicAuth(const CliOptions& opts) {
   if (opts.data_dir.empty()) {
     return std::nullopt;
   }
-  const auto cookie_path = std::filesystem::path(opts.data_dir) / "rpc.cookie";
+  const auto cookie_path =
+      std::filesystem::weakly_canonical(std::filesystem::path(opts.data_dir) / "rpc.cookie");
   std::error_code ec;
   const bool cookie_exists = std::filesystem::exists(cookie_path, ec);
   std::ifstream in(cookie_path);

@@ -826,7 +826,8 @@ Options ParseOptions(int argc, char** argv) {
   }
 
   if (!opts.disable_config_file) {
-    std::filesystem::path config_path = ResolveConfigPath(opts);
+    std::filesystem::path config_path =
+        std::filesystem::weakly_canonical(ResolveConfigPath(opts));
     LoadConfigFile(config_path, &opts);
   }
 
@@ -1004,6 +1005,19 @@ Options ParseOptions(int argc, char** argv) {
       opts.wallet_pass = env;
     }
   }
+  // Canonicalize all user-provided paths to prevent path-traversal attacks.
+  auto canonicalize = [](std::string& p) {
+    if (!p.empty()) {
+      p = std::filesystem::weakly_canonical(std::filesystem::path(p)).string();
+    }
+  };
+  canonicalize(opts.data_dir);
+  canonicalize(opts.wallet_path);
+  canonicalize(opts.debug_log_path);
+  canonicalize(opts.blocks_path);
+  canonicalize(opts.utxo_path);
+  canonicalize(opts.mempool_persist_path);
+  canonicalize(opts.config_path);
   return opts;
 }
 
@@ -1324,7 +1338,8 @@ bool AppInitMain(Options opts, NodeContext* node, qryptcoin::net::AddrManager* a
       return false;
     }
     if (!has_user) {
-      const auto cookie_path = std::filesystem::path(opts.data_dir) / "rpc.cookie";
+      const auto cookie_path = std::filesystem::weakly_canonical(
+          std::filesystem::path(opts.data_dir)) / "rpc.cookie";
       std::error_code ec;
       std::filesystem::create_directories(cookie_path.parent_path(), ec);
       const std::string cookie_user = "qryptcookie";
@@ -1356,7 +1371,8 @@ bool AppInitMain(Options opts, NodeContext* node, qryptcoin::net::AddrManager* a
       // local containers to authenticate via NODE_RPC_USER/NODE_RPC_PASSWORD),
       // still materialize an rpc.cookie file so local tools can authenticate
       // without exposing secrets in process lists.
-      const auto cookie_path = std::filesystem::path(opts.data_dir) / "rpc.cookie";
+      const auto cookie_path = std::filesystem::weakly_canonical(
+          std::filesystem::path(opts.data_dir)) / "rpc.cookie";
       std::error_code ec;
       std::filesystem::create_directories(cookie_path.parent_path(), ec);
       std::ofstream cookie(cookie_path, std::ios::trunc);
@@ -1664,8 +1680,10 @@ void MaintainOutboundPeers(qryptcoin::net::PeerManager* peers,
     const std::string host = candidate->host;
     const std::uint16_t port = candidate->port != 0 ? candidate->port : default_port;
     const bool enforce_identity_pins = candidate->permanent;
-    if (peers->ConnectToPeer(host, port, /*error=*/nullptr, enforce_identity_pins,
-                             allow_duplicate_outbound_host)) {
+    const bool connected = allow_duplicate_outbound_host
+        ? peers->ConnectToPeerAllowDuplicate(host, port, /*error=*/nullptr, enforce_identity_pins)
+        : peers->ConnectToPeer(host, port, /*error=*/nullptr, enforce_identity_pins);
+    if (connected) {
       addrman->MarkResult(host, port, true);
     } else {
       addrman->MarkResult(host, port, false);
@@ -1848,7 +1866,8 @@ int main(int argc, char** argv) {
           max_bytes = static_cast<std::uintmax_t>(opts.log_max_size_mb) * 1024ULL * 1024ULL;
         }
         g_debug_logger.Configure(level, max_bytes, opts.log_max_files);
-        g_debug_logger.Enable(opts.debug_log_path);
+        g_debug_logger.Enable(
+            std::filesystem::weakly_canonical(opts.debug_log_path).string());
         LogDebug("Debug log enabled at " + opts.debug_log_path);
       } catch (const std::exception& ex) {
         std::cerr << "[qryptd] fatal: " << ex.what() << "\n";
@@ -1876,7 +1895,8 @@ int main(int argc, char** argv) {
              ", rpc=" + opts.rpc_bind + ":" + std::to_string(opts.rpc_port) +
              ", p2p_port=" + std::to_string(opts.p2p_port));
 
-    std::filesystem::path data_root(opts.data_dir);
+    const std::filesystem::path data_root =
+        std::filesystem::weakly_canonical(opts.data_dir);
     // Optional static seed overrides loaded from data/<network>/seeds.json.
     try {
       std::filesystem::path seeds_path = data_root / "seeds.json";

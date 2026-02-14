@@ -49,8 +49,12 @@ class PeerManager {
   bool StartListener();
   void Stop();
   bool ConnectToPeer(const std::string& host, std::uint16_t port, std::string* error = nullptr,
-                     bool enforce_identity_pins = true,
-                     bool allow_duplicate_outbound_host = false);
+                     bool enforce_identity_pins = true);
+  // Allow connecting to a host that already has an outbound link. Used only
+  // by the outbound maintenance loop in sparse-network fallback.
+  bool ConnectToPeerAllowDuplicate(const std::string& host, std::uint16_t port,
+                                   std::string* error = nullptr,
+                                   bool enforce_identity_pins = true);
   void BroadcastInventory(const messages::InventoryMessage& inv);
   void BroadcastMessage(const messages::Message& message);
   void BroadcastPing(std::uint64_t nonce);
@@ -85,6 +89,10 @@ class PeerManager {
     PeerInfo info;
     std::shared_ptr<PeerSession> session;
   };
+
+  bool ConnectToPeerInternal(const std::string& host, std::uint16_t port, std::string* error,
+                              bool enforce_identity_pins,
+                              bool allow_duplicate_outbound_host);
 
   void ListenerThread();
   void IdleSweeperThread();

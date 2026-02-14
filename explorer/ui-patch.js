@@ -1053,7 +1053,13 @@
     pill = document.createElement("span");
     pill.id = VORTEX_STATUS_PILL_ID;
     pill.className = "connecting";
-    pill.innerHTML = `<span class="dot"></span><span class="label">LIVE</span>`;
+    const dot = document.createElement("span");
+    dot.className = "dot";
+    const lbl = document.createElement("span");
+    lbl.className = "label";
+    lbl.textContent = "LIVE";
+    pill.appendChild(dot);
+    pill.appendChild(lbl);
     return pill;
   }
 
@@ -1217,22 +1223,21 @@
       const el = document.createElement("div");
       el.className = "qry-vortex-block";
       el.style.setProperty("--qry-fill", pct.toFixed(4));
-      el.innerHTML = `
-        <div class="qry-vortex-block-top">
-          <div class="qry-vortex-block-label"></div>
-          <div class="qry-vortex-block-meta"></div>
-        </div>
-        <div class="qry-vortex-block-fee"></div>
-      `.trim();
-
-      const labelEl = el.querySelector(".qry-vortex-block-label");
-      if (labelEl) labelEl.textContent = label;
-
-      const metaEl = el.querySelector(".qry-vortex-block-meta");
-      if (metaEl) metaEl.textContent = `${formatInt(txCount)} tx • ${formatBytes(used)}`;
-
-      const feeEl = el.querySelector(".qry-vortex-block-fee");
-      if (feeEl) feeEl.textContent = feeText;
+      const topDiv = document.createElement("div");
+      topDiv.className = "qry-vortex-block-top";
+      const labelEl = document.createElement("div");
+      labelEl.className = "qry-vortex-block-label";
+      labelEl.textContent = label;
+      const metaEl = document.createElement("div");
+      metaEl.className = "qry-vortex-block-meta";
+      metaEl.textContent = `${formatInt(txCount)} tx \u2022 ${formatBytes(used)}`;
+      topDiv.appendChild(labelEl);
+      topDiv.appendChild(metaEl);
+      const feeEl = document.createElement("div");
+      feeEl.className = "qry-vortex-block-fee";
+      feeEl.textContent = feeText;
+      el.appendChild(topDiv);
+      el.appendChild(feeEl);
 
       frag.appendChild(el);
     }
@@ -1475,7 +1480,9 @@
     const text = footer.querySelector(".qry-footer-status-text");
 
     if (dot) {
-      dot.className = "qry-footer-status-dot " + state;
+      dot.className = "qry-footer-status-dot";
+      const validStates = ["live", "connecting", "offline"];
+      if (validStates.includes(state)) dot.classList.add(state);
     }
     if (text) {
       const labels = { live: "Connected", connecting: "Connecting", offline: "Offline" };

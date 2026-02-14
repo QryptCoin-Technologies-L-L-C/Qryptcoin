@@ -2,8 +2,17 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <iostream>
 #include <sstream>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#endif
 
 #include "net/messages.hpp"
 #include "util/csprng.hpp"
@@ -98,19 +107,60 @@ void PeerManager::Stop() {
 }
 
 bool PeerManager::ConnectToPeer(const std::string& host, std::uint16_t port, std::string* error,
-                                bool enforce_identity_pins,
-                                bool allow_duplicate_outbound_host) {
+                                bool enforce_identity_pins) {
+  return ConnectToPeerInternal(host, port, error, enforce_identity_pins, false);
+}
+
+bool PeerManager::ConnectToPeerAllowDuplicate(const std::string& host, std::uint16_t port,
+                                              std::string* error,
+                                              bool enforce_identity_pins) {
+  return ConnectToPeerInternal(host, port, error, enforce_identity_pins, true);
+}
+
+bool PeerManager::ConnectToPeerInternal(const std::string& host, std::uint16_t port,
+                                        std::string* error,
+                                        bool enforce_identity_pins,
+                                        bool allow_duplicate_outbound_host) {
   if (error) {
     error->clear();
   }
 
   // Refuse connections that would loop back to our own listener.
-  {
-    const std::string dial_host = NormalizeHostLiteral(ExtractHost(host));
-    const std::string listen_host = NormalizeHostLiteral(ExtractHost(config_.listen_address));
-    if (port == config_.listen_port &&
-        (dial_host == "0.0.0.0" || dial_host == "127.0.0.1" || dial_host == "::1" ||
-         dial_host == "::" || dial_host == listen_host)) {
+  // Uses binary address comparison via inet_pton to canonicalize
+  // representations and prevent address-format bypass.
+  if (port == config_.listen_port) {
+    const std::string dial_str = NormalizeHostLiteral(ExtractHost(host));
+    struct in_addr dial4{};
+    struct in6_addr dial6{};
+    bool is_self = false;
+    if (inet_pton(AF_INET, dial_str.c_str(), &dial4) == 1) {
+      // IPv4 loopback 127.0.0.0/8 or INADDR_ANY (0.0.0.0).
+      const auto host_order = ntohl(dial4.s_addr);
+      is_self = (host_order >> 24) == 127 || host_order == 0;
+      if (!is_self) {
+        struct in_addr listen4{};
+        const std::string listen_str =
+            NormalizeHostLiteral(ExtractHost(config_.listen_address));
+        if (inet_pton(AF_INET, listen_str.c_str(), &listen4) == 1) {
+          is_self = dial4.s_addr == listen4.s_addr;
+        }
+      }
+    } else if (inet_pton(AF_INET6, dial_str.c_str(), &dial6) == 1) {
+      // IPv6 loopback (::1) or unspecified (::).
+      static const struct in6_addr v6_loopback = IN6ADDR_LOOPBACK_INIT;
+      static const struct in6_addr v6_any = IN6ADDR_ANY_INIT;
+      is_self = std::memcmp(&dial6, &v6_loopback, sizeof(dial6)) == 0 ||
+                std::memcmp(&dial6, &v6_any, sizeof(dial6)) == 0;
+      if (!is_self) {
+        struct in6_addr listen6{};
+        const std::string listen_str =
+            NormalizeHostLiteral(ExtractHost(config_.listen_address));
+        if (inet_pton(AF_INET6, listen_str.c_str(), &listen6) == 1) {
+          is_self = std::memcmp(&dial6, &listen6, sizeof(dial6)) == 0;
+        }
+      }
+    }
+    if (is_self) {
       if (error) {
         *error = "refusing self-connection";
       }
