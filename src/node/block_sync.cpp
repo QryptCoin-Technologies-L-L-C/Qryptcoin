@@ -36,6 +36,7 @@ constexpr std::size_t kMaxTransactionsServedPerGetData = 1024;
 constexpr std::size_t kMaxOrphanBlocks = 256;
 constexpr std::size_t kMaxOrphanBytes = 32 * 1024 * 1024;
 constexpr std::size_t kOrphanFifoCompactionThreshold = kMaxOrphanBlocks * 8;
+constexpr std::size_t kMaxStallsBeforeDisconnect = 10;
 
 // Backpressure thresholds for header sync (high-water/low-water to avoid oscillation)
 // High-water: pause requesting headers when these limits are reached
@@ -1473,6 +1474,8 @@ void BlockSyncManager::SendGetHeaders(const net::PeerManager::PeerInfo& info,
   }
   if (!session->Send(net::messages::EncodeGetHeaders(request))) {
     std::cerr << "[sync] failed to send getheaders to peer " << info.id << "\n";
+    peers_.DisconnectPeer(info.id);
+    return;
   }
 }
 
@@ -1499,20 +1502,23 @@ void BlockSyncManager::RequestNextBlock(const net::PeerManager::PeerInfo& info,
     inv.entries.push_back(vec);
     if (!session->Send(net::messages::EncodeGetData(inv))) {
       std::cerr << "[sync] failed to request block from peer " << info.id << "\n";
-      std::lock_guard<std::mutex> lock(mutex_);
-      const auto hex = HashToHex(next);
-      auto it = inflight_blocks_.find(hex);
-      if (it != inflight_blocks_.end()) {
-        auto it_worker = peer_workers_.find(info.id);
-        if (it_worker != peer_workers_.end() &&
-            it_worker->second.inflight_blocks > 0) {
-          --it_worker->second.inflight_blocks;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto hex = HashToHex(next);
+        auto it = inflight_blocks_.find(hex);
+        if (it != inflight_blocks_.end()) {
+          auto it_worker = peer_workers_.find(info.id);
+          if (it_worker != peer_workers_.end() &&
+              it_worker->second.inflight_blocks > 0) {
+            --it_worker->second.inflight_blocks;
+          }
+          inflight_blocks_.erase(it);
         }
-        inflight_blocks_.erase(it);
+        if (download_queue_hashes_.insert(next).second) {
+          download_queue_.push_front(next);
+        }
       }
-      if (download_queue_hashes_.insert(next).second) {
-        download_queue_.push_front(next);
-      }
+      peers_.DisconnectPeer(info.id);
       return;
     }
   }
@@ -2019,6 +2025,7 @@ void BlockSyncManager::StallWatcher(std::stop_token stop) {
   while (!stop.stop_requested()) {
     std::this_thread::sleep_for(std::chrono::seconds(5));
     std::vector<std::pair<std::uint64_t, primitives::Hash256>> stalled;
+    std::vector<std::pair<std::uint64_t, std::size_t>> stalled_peer_ids;
     bool backpressure_was_active = header_backpressure_active_.load();
     bool should_resume_headers = false;
     std::vector<std::pair<net::PeerManager::PeerInfo, std::shared_ptr<net::PeerSession>>> peers_to_resume;
@@ -2098,6 +2105,12 @@ void BlockSyncManager::StallWatcher(std::stop_token stop) {
         it = inflight_transactions_.erase(it);
       }
       stalls_detected_.fetch_add(stalled.size());
+
+      for (const auto& kv : peer_workers_) {
+        if (kv.second.stall_count >= kMaxStallsBeforeDisconnect) {
+          stalled_peer_ids.emplace_back(kv.first, kv.second.stall_count);
+        }
+      }
 
       // Check for sync stall: headers ahead but no block progress. This can
       // happen when header recovery is blocked and no block requests are in
@@ -2184,6 +2197,11 @@ void BlockSyncManager::StallWatcher(std::stop_token stop) {
           }
         }
       }
+    }
+    for (const auto& item : stalled_peer_ids) {
+      std::cerr << "[sync] disconnecting peer " << item.first << " after " << item.second
+                << " stalled requests\n";
+      peers_.DisconnectPeer(item.first);
     }
     // Apply small ban scores and try to reassign work.
     for (const auto& item : stalled) {

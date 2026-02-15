@@ -619,18 +619,28 @@ std::unordered_set<std::string> PeerManager::GetConnectedOutboundHosts() const {
 }
 
 std::uint64_t PeerManager::EvictStalestOutboundPeer() {
+  return EvictStalestOutboundPeer({});
+}
+
+std::uint64_t PeerManager::EvictStalestOutboundPeer(
+    const std::unordered_map<std::uint64_t, std::uint64_t>& sync_staleness_ms) {
   std::uint64_t victim_id = 0;
   {
     std::lock_guard<std::mutex> lock(peers_mutex_);
     const auto now = std::chrono::steady_clock::now();
-    std::chrono::steady_clock::duration longest_idle{};
+    std::chrono::steady_clock::duration longest_staleness{};
     for (const auto& entry : peers_) {
       if (entry.info.inbound || !entry.session) {
         continue;
       }
-      const auto idle = now - entry.session->LastActivity();
-      if (idle > longest_idle) {
-        longest_idle = idle;
+      std::chrono::steady_clock::duration staleness =
+          now - entry.session->LastActivity();
+      const auto it = sync_staleness_ms.find(entry.info.id);
+      if (it != sync_staleness_ms.end() && it->second > 0) {
+        staleness = std::chrono::milliseconds(it->second);
+      }
+      if (staleness > longest_staleness) {
+        longest_staleness = staleness;
         victim_id = entry.info.id;
       }
     }

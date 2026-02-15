@@ -83,6 +83,8 @@ class PeerManager {
   // for a fresh connection attempt.  Returns the evicted peer's ID,
   // or 0 if no outbound peer could be evicted.
   std::uint64_t EvictStalestOutboundPeer();
+  std::uint64_t EvictStalestOutboundPeer(
+      const std::unordered_map<std::uint64_t, std::uint64_t>& sync_staleness_ms);
 
  private:
   struct PeerEntry {

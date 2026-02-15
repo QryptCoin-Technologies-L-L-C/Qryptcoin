@@ -29,6 +29,8 @@ class TcpSocket {
   std::ptrdiff_t Send(const std::uint8_t* data, std::size_t length) const;
   std::ptrdiff_t Recv(std::uint8_t* data, std::size_t length) const;
   bool SetTimeout(int milliseconds);
+  bool EnableKeepAlive(std::uint32_t idle_s = 60, std::uint32_t interval_s = 10,
+                       std::uint32_t max_probes = 5);
   std::string PeerAddress() const;
   void Close();
   bool IsValid() const noexcept;

@@ -12,6 +12,7 @@
 #ifdef _WIN32
 #include <WS2tcpip.h>
 #include <winsock2.h>
+#include <mstcpip.h>
 #ifdef _MSC_VER
 #pragma comment(lib, "Ws2_32.lib")
 #endif
@@ -21,6 +22,7 @@ constexpr socket_handle kInvalidSocket = INVALID_SOCKET;
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <netinet/tcp.h>
 #include <sys/time.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -267,6 +269,7 @@ bool TcpSocket::Connect(const std::string& host, std::uint16_t port, bool quiet)
                            kConnectTimeoutMs, quiet, host, port)) {
       Close();
       handle_ = static_cast<std::intptr_t>(sock);
+      EnableKeepAlive();
       freeaddrinfo(result);
       return true;
     }
@@ -428,7 +431,12 @@ bool TcpSocket::BindAndListen(const std::string& address, std::uint16_t port, in
 TcpSocket TcpSocket::Accept() const {
   if (!IsValid()) return TcpSocket(kInvalidSocket);
   socket_handle client = ::accept(handle_, nullptr, nullptr);
-  return TcpSocket(client);
+  if (client == kInvalidSocket) {
+    return TcpSocket(kInvalidSocket);
+  }
+  TcpSocket peer(client);
+  peer.EnableKeepAlive();
+  return peer;
 }
 
 TcpSocket TcpSocket::AcceptWithTimeout(int timeout_ms) const {
@@ -451,7 +459,12 @@ TcpSocket TcpSocket::AcceptWithTimeout(int timeout_ms) const {
     return TcpSocket(kInvalidSocket);
   }
   socket_handle client = ::accept(handle_, nullptr, nullptr);
-  return TcpSocket(client);
+  if (client == kInvalidSocket) {
+    return TcpSocket(kInvalidSocket);
+  }
+  TcpSocket peer(client);
+  peer.EnableKeepAlive();
+  return peer;
 }
 
 std::ptrdiff_t TcpSocket::Send(const std::uint8_t* data, std::size_t length) const {
@@ -486,6 +499,49 @@ bool TcpSocket::SetTimeout(int milliseconds) {
   };
   return ::setsockopt(handle_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0 &&
          ::setsockopt(handle_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == 0;
+#endif
+}
+
+bool TcpSocket::EnableKeepAlive(std::uint32_t idle_s, std::uint32_t interval_s, std::uint32_t max_probes) {
+  if (!IsValid()) {
+    return false;
+  }
+#ifdef _WIN32
+  const int enable = 1;
+  if (setsockopt(handle_, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char*>(&enable),
+                sizeof(enable)) != 0) {
+    return false;
+  }
+  tcp_keepalive keep_alive{};
+  keep_alive.onoff = 1;
+  keep_alive.keepalivetime = idle_s * 1000;
+  keep_alive.keepaliveinterval = interval_s * 1000;
+  DWORD bytes_returned = 0;
+  if (WSAIoctl(handle_, SIO_KEEPALIVE_VALS, &keep_alive, sizeof(keep_alive), nullptr, 0,
+               &bytes_returned, nullptr, nullptr) != 0) {
+    (void)max_probes;
+    return true;
+  }
+  (void)max_probes;
+  return true;
+#else
+  const int enable = 1;
+  if (setsockopt(handle_, SOL_SOCKET, SO_KEEPALIVE, &enable, sizeof(enable)) != 0) {
+    return false;
+  }
+  const int idle = static_cast<int>(idle_s);
+  const int interval = static_cast<int>(interval_s);
+  const int probes = static_cast<int>(max_probes);
+#ifdef TCP_KEEPIDLE
+  if (setsockopt(handle_, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle)) != 0) return false;
+#endif
+#ifdef TCP_KEEPINTVL
+  if (setsockopt(handle_, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval)) != 0) return false;
+#endif
+#ifdef TCP_KEEPCNT
+  if (setsockopt(handle_, IPPROTO_TCP, TCP_KEEPCNT, &probes, sizeof(probes)) != 0) return false;
+#endif
+  return true;
 #endif
 }
 

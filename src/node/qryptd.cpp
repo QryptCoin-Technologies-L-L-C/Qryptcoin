@@ -18,6 +18,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -1819,15 +1820,21 @@ void WaitForShutdown(NodeContext& node, qryptcoin::net::AddrManager* addrman,
           last_known_height = current_height;
           last_height_change = now;
         } else if (now - last_height_change > kStaleTipThreshold) {
-          // Tip hasn't advanced — rotate the stalest outbound peer.
-          const auto evicted = node.peer_manager->EvictStalestOutboundPeer();
+          // Tip hasn't advanced — rotate the stalest outbound peer using sync-age.
+          std::unordered_map<std::uint64_t, std::uint64_t> sync_staleness_ms;
+          if (node.sync_manager) {
+            for (const auto& stats : node.sync_manager->GetPeerSyncStats()) {
+              sync_staleness_ms[stats.peer_id] = stats.last_response_ms;
+            }
+          }
+          const auto evicted = node.peer_manager->EvictStalestOutboundPeer(sync_staleness_ms);
           if (evicted != 0) {
             std::cerr << "[qryptd] stale tip detected (height " << current_height
                       << " unchanged for " << std::chrono::duration_cast<std::chrono::seconds>(
                              now - last_height_change).count()
                       << "s), evicted outbound peer " << evicted << "\n";
-            // Reset the timer so we don't spam evictions every check.
-            last_height_change = now;
+            // Reset the timer so the next stale-tip check is much sooner.
+            last_height_change = now - kStaleTipThreshold + std::chrono::seconds(30);
           }
         }
       }

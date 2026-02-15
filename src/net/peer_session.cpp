@@ -380,8 +380,9 @@ bool PeerSession::PerformHandshake(const config::NetworkConfig& cfg,
       return false;
     }
   }
-  // Clear the handshake timeout; higher-level idle timeouts handle quiet peers.
-  secure_channel_.SetTimeout(0);
+  // Set a finite read timeout after handshake; idle peers are handled by
+  // sync-level and peer lifecycle timeouts.
+  secure_channel_.SetTimeout(60000);
   return true;
 }
 
