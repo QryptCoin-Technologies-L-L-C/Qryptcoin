@@ -1,16 +1,26 @@
 # QryptCoin Core
 
+> **This project has been sunset as of March 14, 2026.**
+>
+> QryptCoin is no longer under active development. The network is no longer maintained, and no further releases, patches, or support will be provided. This repository is archived and preserved in read-only mode for reference purposes only.
+>
+> Thank you to everyone who showed interest in the project.
+>
+> — Mikhael, QryptCoin Technologies LLC
+
+---
+
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/11837/badge)](https://www.bestpractices.dev/projects/11837)
 
-QryptCoin Core is the reference implementation of the QryptCoin protocol, maintained by **QryptCoin Technologies LLC**.
+QryptCoin Core was the reference implementation of the QryptCoin protocol, maintained by **QryptCoin Technologies LLC**.
 
-QryptCoin is a peer-to-peer electronic cash system that enables direct value transfer without reliance on centralized intermediaries. The system uses a proof-of-work blockchain to establish a globally ordered ledger of transactions, with ownership represented by unspent transaction outputs (UTXOs).
+QryptCoin was a peer-to-peer electronic cash system that enabled direct value transfer without reliance on centralized intermediaries. The system used a proof-of-work blockchain to establish a globally ordered ledger of transactions, with ownership represented by unspent transaction outputs (UTXOs).
 
-This repository contains the full node software required to participate in the QryptCoin network by validating blocks, relaying transactions, and enforcing consensus rules.
+This repository contains the full node software that was required to participate in the QryptCoin network by validating blocks, relaying transactions, and enforcing consensus rules.
 
 ## Overview
 
-The QryptCoin protocol combines a conservative proof-of-work consensus mechanism with post-quantum digital signatures to provide long-term cryptographic durability.
+The QryptCoin protocol combined a conservative proof-of-work consensus mechanism with post-quantum digital signatures to provide long-term cryptographic durability.
 
 Key properties:
 
@@ -20,14 +30,16 @@ Key properties:
 - Explicit witness commitment for malleability resistance
 - Fixed and auditable consensus limits
 
-This implementation enforces the consensus rules described in the protocol documentation and the published whitepaper.
+This implementation enforced the consensus rules described in the protocol documentation and the published whitepaper.
 
-## Network Resources
+## Network Resources (Offline)
 
-- **Block Explorer**: [explorer.qryptcoin.org](https://explorer.qryptcoin.org)
-- **Mempool Explorer**: [mempool.qryptcoin.org](https://mempool.qryptcoin.org)
-- **Website**: [qryptcoin.org](https://qryptcoin.org)
-- **Telegram**: [Community](https://t.me/QryptcoinOfficial)
+The following services are no longer operational:
+
+- ~~Block Explorer: explorer.qryptcoin.org~~
+- ~~Mempool Explorer: mempool.qryptcoin.org~~
+- ~~Website: qryptcoin.org~~
+- ~~Telegram: Community~~
 
 
 ## Repository contents
